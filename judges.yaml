@@ -1,0 +1,20 @@
+judges:
+  bare:
+    description: "Bare model, no face"
+    model: claude-sonnet-4-6
+    provider: anthropic
+    face: null
+
+  # judge-feynman:
+  #   description: "Judge face compiled from Feynman sources"
+  #   model: claude-sonnet-4-6
+  #   provider: anthropic
+  #   face: "judge@claude-sonnet-4-6"   # Faces alias@model syntax
+
+problems:
+  - "000"
+  - "001"
+
+budget:
+  max_turns: 10        # hard ceiling on agent tool-calling iterations
+  token_budget: 20000  # informational — passed to agent in prompt
