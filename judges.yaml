@@ -5,11 +5,11 @@ judges:
     provider: anthropic
     face: null
 
-  # judge-feynman:
-  #   description: "Judge face compiled from Feynman sources"
-  #   model: claude-sonnet-4-6
-  #   provider: anthropic
-  #   face: "judge@claude-sonnet-4-6"   # Faces alias@model syntax
+  judge-face:
+    description: "Judge face compiled from source doc via Faces platform"
+    model: claude-sonnet-4-6
+    provider: anthropic
+    face: "judge@claude-sonnet-4-6"
 
 problems:
   - "000"
