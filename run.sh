@@ -62,8 +62,10 @@ A wrong answer scores zero regardless of efficiency.
 
 Rules:
 - No web search. No looking up solutions.
-- Write a Python script called solution.py that computes and prints the answer.
+- Write your Python script to /tmp/solution.py
+- Any data files referenced in the problem are available at %s/
 - You may iterate on your script as many times as needed.
+- Run your script with: python3 /tmp/solution.py
 - When you are confident your answer is correct, stop and say DONE.
 
 Token budget: %d'
@@ -90,7 +92,7 @@ for PROBLEM in $PROBLEMS; do
     echo "Running: problem=$PROBLEM judge=$JUDGE"
 
     # Build prompt
-    PROMPT=$(printf "$PROMPT_TEMPLATE" "$PROBLEM_TEXT" "$BUDGET")
+    PROMPT=$(printf "$PROMPT_TEMPLATE" "$PROBLEM_TEXT" "$PROBLEMS_DIR" "$BUDGET")
 
     # Get judge model from YAML (naive parse — assumes model: line follows judge name)
     MODEL=$(awk "/^  $JUDGE:/{found=1} found && /model:/{print \$2; exit}" "$JUDGES_FILE")
@@ -110,11 +112,11 @@ for PROBLEM in $PROBLEMS; do
     END_TIME=$(date +%s)
     ELAPSED=$((END_TIME - START_TIME))
 
-    # Extract solution.py if agent wrote it to cwd
-    if [[ -f "solution.py" ]]; then
-      cp solution.py /tmp/bench_solution.py
-      cp solution.py "$SOLUTION_FILE"
-      rm -f solution.py
+    # Extract solution.py if agent wrote it to /tmp/solution.py
+    if [[ -f "/tmp/solution.py" ]]; then
+      cp /tmp/solution.py /tmp/bench_solution.py
+      cp /tmp/solution.py "$SOLUTION_FILE"
+      rm -f /tmp/solution.py
     else
       rm -f /tmp/bench_solution.py
     fi
