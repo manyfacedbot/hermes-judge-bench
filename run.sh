@@ -99,36 +99,39 @@ for PROBLEM in $PROBLEMS; do
     START_TIME=$(date +%s)
 
     # Run hermes in oneshot mode, capture full output
-    RESPONSE=$(hermes -z "$PROMPT" \
+    hermes -z "$PROMPT" \
       -m "$MODEL" \
       --provider "$PROVIDER" \
       -t terminal,file \
-      2>/dev/null) || true
+      2>/dev/null > /tmp/bench_response.txt || true
+
+    RESPONSE=$(cat /tmp/bench_response.txt)
 
     END_TIME=$(date +%s)
     ELAPSED=$((END_TIME - START_TIME))
 
-    # Extract solution.py if it exists in the working dir
-    SOLUTION=""
+    # Extract solution.py if agent wrote it to cwd
     if [[ -f "solution.py" ]]; then
-      SOLUTION=$(cat solution.py)
+      cp solution.py /tmp/bench_solution.py
       cp solution.py "$SOLUTION_FILE"
       rm -f solution.py
+    else
+      rm -f /tmp/bench_solution.py
     fi
 
-    # Write result JSON
-    python3 -c "
-import json, sys
+    # Write result JSON safely via python
+    python3 - <<PYEOF > "$RESULT_FILE"
+import json
 result = {
-    'problem': '$PROBLEM',
-    'judge': '$JUDGE',
-    'model': '$MODEL',
-    'elapsed_seconds': $ELAPSED,
-    'response': $(python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' <<< \"\$RESPONSE\"),
-    'solution': $(python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' <<< \"\$SOLUTION\"),
+    "problem": """$PROBLEM""",
+    "judge": """$JUDGE""",
+    "model": """$MODEL""",
+    "elapsed_seconds": $ELAPSED,
+    "response": open("/tmp/bench_response.txt").read() if __import__("os").path.exists("/tmp/bench_response.txt") else "",
+    "solution": open("/tmp/bench_solution.py").read() if __import__("os").path.exists("/tmp/bench_solution.py") else "",
 }
 print(json.dumps(result, indent=2))
-" > "$RESULT_FILE"
+PYEOF
 
     echo "  → saved to $RESULT_FILE (${ELAPSED}s)"
     echo ""
