@@ -38,6 +38,8 @@ import subprocess
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 POETRY_PROBLEMS = {"100", "101", "102", "103"}
+ZKP_PROBLEMS = {"200", "201", "202"}
+
 POETRY_CORPUS = {
     "100": "corpus/romantic_nature.json",
     "101": "corpus/victorian_lyric.json",
@@ -46,6 +48,7 @@ POETRY_CORPUS = {
 }
 
 POETRY_EVAL = os.path.join(REPO_DIR, "problems", "poetry_eval.py")
+ZKP_EVAL    = os.path.join(REPO_DIR, "problems", "zkp_eval.py")
 
 
 def load_answers():
@@ -166,7 +169,41 @@ def score_results(results_dir: str, heat_filter: str | None):
                 with open(sol_path) as sf:
                     solution = sf.read()
 
-        if problem in POETRY_PROBLEMS:
+        if problem in ZKP_PROBLEMS:
+            # ZKP scoring — run zkp_eval.py, use total_score (mechanical + qualitative)
+            # qualitative_score may be None if judge hasn't scored it yet
+            tmp = f"/tmp/zkp_solution_{problem}.py"
+            with open(tmp, "w") as f:
+                f.write(solution)
+            try:
+                r = subprocess.run(
+                    ["python3", ZKP_EVAL, "--solution", tmp],
+                    capture_output=True, text=True, timeout=180
+                )
+                if r.stdout.strip():
+                    res = json.loads(r.stdout)
+                    total = res.get("total_score", 0.0)
+                    mech  = res.get("mechanical_score", 0.0)
+                    qual  = res.get("qualitative_score")
+                    correctness = total / 6.0  # normalise to [0,1] range for pareto
+                    qual_str = f"{qual:.1f}" if qual is not None else "pending"
+                    got = f"mech={mech:.1f} qual={qual_str} tot={total:.1f}/6"
+                else:
+                    correctness = 0.0
+                    got = "eval failed"
+            except Exception as e:
+                correctness = 0.0
+                got = f"error: {e}"
+            if total_tokens > 0:
+                pareto = correctness / (1 + total_tokens / 10000)
+                token_note = f"{raw_tok}+{cache_r}cr"
+            else:
+                pareto = correctness / (1 + elapsed / 60)
+                token_note = f"{elapsed}s~"
+            expected = "mech+qual/6"
+            score_type = "zkp"
+
+        elif problem in POETRY_PROBLEMS:
             eval_result = run_poetry_eval(solution, problem)
             verified = eval_result.get("verified", False)
             compression_ratio = eval_result.get("compression_ratio", 0.0)

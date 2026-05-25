@@ -54,6 +54,9 @@ PROBLEM_LABELS = {
     "101": "poetry: victorian lyric",
     "102": "poetry: ode & elegy",
     "103": "poetry: sonnet",
+    "200": "ZKP: subset-sum partition",
+    "201": "ZKP: graph 3-colouring",
+    "202": "ZKP: discrete log",
 }
 
 JUDGE_COLORS = {
@@ -66,6 +69,7 @@ JUDGE_COLORS = {
 CATEGORY_SHAPES = {
     "euler":   "circle",
     "poetry":  "diamond",
+    "zkp":     "star",
     "smoke":   "square",
     "unknown": "cross",
 }
@@ -74,6 +78,7 @@ def problem_category(pid):
     if pid == "000":              return "smoke"
     if pid.startswith("0"):       return "euler"
     if pid in POETRY_PROBLEMS:    return "poetry"
+    if pid in {"200","201","202"}: return "zkp"
     return "unknown"
 
 
@@ -452,6 +457,7 @@ def build_html(runs: list[dict], heat_filter: str | None) -> str:
     <div class="legend-note">
       <span>● circle = euler problem</span>
       <span>◆ diamond = poetry compression</span>
+      <span>★ star = ZKP</span>
       <span>■ square = smoke test</span>
       <span>── white line = global Pareto frontier</span>
       <span>- - dashed = per-judge frontier</span>
