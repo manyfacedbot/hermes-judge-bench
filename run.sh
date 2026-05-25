@@ -142,22 +142,26 @@ for PROBLEM in $PROBLEMS; do
       rm -f /tmp/bench_solution.py
     fi
 
-    # Write result JSON safely via python
-    python3 - <<PYEOF > "$RESULT_FILE"
-import json
+    # Write result JSON safely via python (use temp file to avoid heredoc quoting issues)
+    python3 -c "
+import json, sys, os
+
+response = open('/tmp/bench_response.txt').read() if os.path.exists('/tmp/bench_response.txt') else ''
+solution = open('/tmp/bench_solution.py').read() if os.path.exists('/tmp/bench_solution.py') else ''
+
 result = {
-    "problem": """$PROBLEM""",
-    "judge": """$JUDGE""",
-    "model": """$MODEL""",
-    "elapsed_seconds": $ELAPSED,
-    "token_budget": $TOKEN_BUDGET,
-    "wall_budget": $WALL_BUDGET,
-    "killed_by_timeout": ${KILLED_BY_TIMEOUT},
-    "response": open("/tmp/bench_response.txt").read() if __import__("os").path.exists("/tmp/bench_response.txt") else "",
-    "solution": open("/tmp/bench_solution.py").read() if __import__("os").path.exists("/tmp/bench_solution.py") else "",
+    'problem':          sys.argv[1],
+    'judge':            sys.argv[2],
+    'model':            sys.argv[3],
+    'elapsed_seconds':  int(sys.argv[4]),
+    'token_budget':     int(sys.argv[5]),
+    'wall_budget':      int(sys.argv[6]),
+    'killed_by_timeout': sys.argv[7] == 'true',
+    'response':         response,
+    'solution':         solution,
 }
 print(json.dumps(result, indent=2))
-PYEOF
+" "$PROBLEM" "$JUDGE" "$MODEL" "$ELAPSED" "$TOKEN_BUDGET" "$WALL_BUDGET" "$KILLED_BY_TIMEOUT" > "$RESULT_FILE"
 
     echo "  → saved to $RESULT_FILE (${ELAPSED}s)"
     echo ""
