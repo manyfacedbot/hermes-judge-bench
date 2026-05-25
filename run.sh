@@ -133,6 +133,27 @@ for PROBLEM in $PROBLEMS; do
     fi
     unset TIMED_OUT
 
+    # Grab actual token counts from the session hermes just created
+    SESSION_ID=$(hermes sessions list --limit 1 2>/dev/null | tail -1 | awk '{print $NF}')
+    INPUT_TOKENS=0
+    OUTPUT_TOKENS=0
+    CACHE_READ_TOKENS=0
+    CACHE_WRITE_TOKENS=0
+    if [[ -n "$SESSION_ID" ]]; then
+      TOKEN_JSON=$(hermes sessions export --session-id "$SESSION_ID" - 2>/dev/null | \
+        python3 -c "
+import json, sys
+data = [json.loads(l) for l in sys.stdin if l.strip()]
+if data:
+    r = data[0]
+    print(r.get('input_tokens', 0), r.get('output_tokens', 0), r.get('cache_read_tokens', 0), r.get('cache_write_tokens', 0))
+else:
+    print('0 0 0 0')
+" 2>/dev/null || echo "0 0 0 0")
+      read INPUT_TOKENS OUTPUT_TOKENS CACHE_READ_TOKENS CACHE_WRITE_TOKENS <<< "$TOKEN_JSON"
+    fi
+    TOTAL_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
+
     # Extract solution.py if agent wrote it to /tmp/solution.py
     if [[ -f "/tmp/solution.py" ]]; then
       cp /tmp/solution.py /tmp/bench_solution.py
@@ -150,20 +171,27 @@ response = open('/tmp/bench_response.txt').read() if os.path.exists('/tmp/bench_
 solution = open('/tmp/bench_solution.py').read() if os.path.exists('/tmp/bench_solution.py') else ''
 
 result = {
-    'problem':          sys.argv[1],
-    'judge':            sys.argv[2],
-    'model':            sys.argv[3],
-    'elapsed_seconds':  int(sys.argv[4]),
-    'token_budget':     int(sys.argv[5]),
-    'wall_budget':      int(sys.argv[6]),
-    'killed_by_timeout': sys.argv[7] == 'true',
-    'response':         response,
-    'solution':         solution,
+    'problem':            sys.argv[1],
+    'judge':              sys.argv[2],
+    'model':              sys.argv[3],
+    'elapsed_seconds':    int(sys.argv[4]),
+    'token_budget':       int(sys.argv[5]),
+    'wall_budget':        int(sys.argv[6]),
+    'killed_by_timeout':  sys.argv[7] == 'true',
+    'input_tokens':       int(sys.argv[8]),
+    'output_tokens':      int(sys.argv[9]),
+    'cache_read_tokens':  int(sys.argv[10]),
+    'cache_write_tokens': int(sys.argv[11]),
+    'total_tokens':       int(sys.argv[12]),
+    'response':           response,
+    'solution':           solution,
 }
 print(json.dumps(result, indent=2))
-" "$PROBLEM" "$JUDGE" "$MODEL" "$ELAPSED" "$TOKEN_BUDGET" "$WALL_BUDGET" "$KILLED_BY_TIMEOUT" > "$RESULT_FILE"
+" "$PROBLEM" "$JUDGE" "$MODEL" "$ELAPSED" "$TOKEN_BUDGET" "$WALL_BUDGET" "$KILLED_BY_TIMEOUT" \
+  "$INPUT_TOKENS" "$OUTPUT_TOKENS" "$CACHE_READ_TOKENS" "$CACHE_WRITE_TOKENS" "$TOTAL_TOKENS" \
+  > "$RESULT_FILE"
 
-    echo "  → saved to $RESULT_FILE (${ELAPSED}s)"
+    echo "  → saved to $RESULT_FILE (${ELAPSED}s, ${TOTAL_TOKENS} tokens)"
     echo ""
   done
 done

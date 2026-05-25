@@ -114,15 +114,22 @@ def score_results(results_dir: str):
         elapsed = data.get("elapsed_seconds", 0)
         solution = data.get("solution", "")
         killed = data.get("killed_by_timeout", False)
+        total_tokens = data.get("total_tokens", 0)  # actual tokens; 0 = legacy result (no token data)
+        token_note = ""  # set below for poetry problems
 
         if problem in POETRY_PROBLEMS:
-            # Poetry compression scoring
+            # Poetry compression scoring — use actual tokens if available, else fall back to elapsed
             eval_result = run_poetry_eval(solution, problem)
             verified = eval_result.get("verified", False)
             compression_ratio = eval_result.get("compression_ratio", 0.0)
             correctness = compression_ratio if verified else 0.0
-            pareto = correctness / (1 + elapsed / 60) if elapsed >= 0 else 0.0
-            expected = f"cr>{1.0:.2f} verified"
+            if total_tokens > 0:
+                pareto = correctness / (1 + total_tokens / 10000)
+                token_note = f"{total_tokens}tok"
+            else:
+                pareto = correctness / (1 + elapsed / 60)
+                token_note = f"{elapsed}s~"  # ~ = proxy (no token data in this result)
+            expected = "cr>1.0 verified"
             got = f"cr={compression_ratio:.3f} {'✓' if verified else '✗'}"
             score_type = "poetry"
         elif problem == "000":
@@ -152,6 +159,8 @@ def score_results(results_dir: str):
             "judge": judge,
             "model": model,
             "elapsed_s": elapsed,
+            "total_tokens": total_tokens,
+            "token_note": token_note if problem in POETRY_PROBLEMS else "",
             "correctness": round(correctness, 4),
             "pareto_score": round(pareto, 4),
             "expected": expected,
@@ -183,13 +192,13 @@ def score_results(results_dir: str):
             )
 
     if poetry_rows:
-        print("\n### Poetry Compression Problems (compression_ratio / (1 + elapsed_s/60))\n")
-        print("  Note: elapsed_seconds proxies token usage (true formula: cr / (1 + tokens/10000))\n")
+        print("\n### Poetry Compression Problems (compression_ratio / (1 + tokens/10000))\n")
+        print("  ~ = elapsed_seconds proxy (legacy result, no token data)\n")
         for r in sorted(poetry_rows, key=lambda x: -x["pareto_score"]):
             timeout_str = "⏱TIMEOUT" if r.get("killed") else ""
             print(
                 f"{r['problem']:<10} {r['judge']:<20} {r['model']:<25} "
-                f"{r['elapsed_s']:>7}s {str(r['correctness']):>10} {r['pareto_score']:>8} "
+                f"{str(r['token_note']):>10} {str(r['correctness']):>10} {r['pareto_score']:>8} "
                 f"{str(r['got']):>20} {timeout_str:>6}"
             )
     print()
