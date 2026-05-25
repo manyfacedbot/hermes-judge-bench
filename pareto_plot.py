@@ -160,7 +160,11 @@ def load_runs(results_dir: str, heat_filter: str | None) -> list[dict]:
         raw_tok = data.get("input_tokens", 0) + data.get("output_tokens", 0)
         cache_r = data.get("cache_read_tokens", 0)
 
-        quality = eval_solution(solution, data["problem"])
+        # ZKP quality requires a human judge score — read from result JSON if present
+        if data["problem"] in {"200", "201", "202"} and "quality" in data:
+            quality = float(data["quality"])
+        else:
+            quality = eval_solution(solution, data["problem"])
 
         runs.append({
             "heat":      data.get("heat", "?"),
@@ -237,7 +241,7 @@ def build_html(runs: list[dict], heat_filter: str | None) -> str:
     judge_points: dict[str, list] = {j: [] for j in judges}
 
     for judge in judges:
-        for cat in ["euler", "poetry", "smoke", "unknown"]:
+        for cat in ["euler", "poetry", "zkp", "smoke", "unknown"]:
             pts = [r for r in runs if r["judge"] == judge and r["category"] == cat]
             if not pts:
                 continue
