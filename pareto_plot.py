@@ -496,7 +496,7 @@ def main():
         f.write(html)
 
     print(f"  Written to {args.out}")
-    print(f"  Live at: http://135.181.89.192:8437/{os.path.basename(args.out)}")
+    print(f"  Live at: https://bench.headwaters.ai/{os.path.basename(args.out)}")
 
 
 if __name__ == "__main__":
