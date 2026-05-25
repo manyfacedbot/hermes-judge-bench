@@ -41,7 +41,7 @@ sys.path.insert(0, REPO_DIR)
 from archipelago import play_best_of_3, board_to_str, MOVES_PER_PLAYER, random_bot
 
 PROBLEM_FILE = os.path.join(os.path.dirname(REPO_DIR), "problems", "300.md")
-TOKEN_BUDGET_DEFAULT = 20000
+TOKEN_BUDGET_DEFAULT = 40000
 ROUNDS_DEFAULT = 20
 MOVE_TIMEOUT = 5
 
