@@ -451,22 +451,28 @@ def run_tournament(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--judge-a", default="bare")
-    parser.add_argument("--judge-b", default="judge-face")
+    parser.add_argument("--judges", required=True,
+                        help="Exactly two judge names, comma-separated (e.g. bare,judge-face)")
     parser.add_argument("--rounds", type=int, default=ROUNDS_DEFAULT)
     parser.add_argument("--token-budget", type=int, default=TOKEN_BUDGET_DEFAULT)
-    parser.add_argument("--heat", default=f"heat_{int(time.time())}")
     parser.add_argument("--results-dir", default=os.path.join(os.path.dirname(REPO_DIR), "results"))
     parser.add_argument("--judges-file", default=os.path.join(os.path.dirname(REPO_DIR), "judges.yaml"))
     parser.add_argument("--problem-file", default=PROBLEM_FILE)
     args = parser.parse_args()
 
+    judges = [j.strip() for j in args.judges.split(",")]
+    if len(judges) != 2:
+        print(f"Error: --judges requires exactly 2 comma-separated judges, got {len(judges)}: {judges}")
+        sys.exit(1)
+
+    heat_id = f"heat_{int(time.time())}"
+
     run_tournament(
-        judge_a=args.judge_a,
-        judge_b=args.judge_b,
+        judge_a=judges[0],
+        judge_b=judges[1],
         rounds=args.rounds,
         token_budget=args.token_budget,
-        heat_id=args.heat,
+        heat_id=heat_id,
         results_dir=args.results_dir,
         judges_file=args.judges_file,
         problem_file=args.problem_file,
