@@ -29,8 +29,8 @@ score.py                # pareto scorer → markdown leaderboard
 # Smoke test (problem 000 — haiku)
 ./run.sh --problems 000 --judges bare
 
-# Poetry compression problems (all four categories)
-./run.sh --problems 100,101,102,103 --judges bare
+# Poetry compression problems (all four categories, both judges)
+./run.sh --problems 100,101,102,103 --judges bare,judge-face
 
 # Score everything
 python3 score.py
