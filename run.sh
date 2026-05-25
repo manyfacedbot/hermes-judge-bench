@@ -17,17 +17,22 @@ PROBLEMS_DIR="$REPO_DIR/problems"
 RESULTS_DIR="$REPO_DIR/results"
 ANSWERS_FILE="$REPO_DIR/answers.json"
 JUDGES_FILE="$REPO_DIR/judges.yaml"
-BUDGET=20000
+TOKEN_BUDGET=20000   # max inference tokens agent may spend (passed to agent in prompt)
+WALL_BUDGET=300      # max wall-clock seconds per run before we kill the agent
 
 mkdir -p "$RESULTS_DIR"
 
 # Parse args
 FILTER_PROBLEMS=""
 FILTER_JUDGES=""
+TOKEN_BUDGET_ARG=""
+WALL_BUDGET_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --problems) FILTER_PROBLEMS="$2"; shift 2 ;;
     --judges)   FILTER_JUDGES="$2";   shift 2 ;;
+    --token-budget) TOKEN_BUDGET="$2"; TOKEN_BUDGET_ARG="$2"; shift 2 ;;
+    --wall-budget)  WALL_BUDGET="$2";  WALL_BUDGET_ARG="$2";  shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -68,10 +73,17 @@ Rules:
 - Run your script with: python3 /tmp/solution.py
 - When you are confident your answer is correct, stop and say DONE.
 
-Token budget: %d'
+Hard limits (enforced externally — you will be cut off if you exceed either):
+  Token budget : %d tokens (input + output combined)
+  Wall-clock   : %d seconds
+
+Stay well within these limits. A correct answer submitted with tokens to spare
+beats a better answer that is cut off mid-run.'
 
 echo ""
 echo "=== hermes-judge-bench ==="
+echo "Token budget : ${TOKEN_BUDGET} tokens"
+echo "Wall budget  : ${WALL_BUDGET}s"
 echo "Problems : $(echo $PROBLEMS | tr '\n' ' ')"
 echo "Judges   : $(echo $JUDGES | tr '\n' ' ')"
 echo ""
@@ -92,7 +104,7 @@ for PROBLEM in $PROBLEMS; do
     echo "Running: problem=$PROBLEM judge=$JUDGE"
 
     # Build prompt
-    PROMPT=$(printf "$PROMPT_TEMPLATE" "$PROBLEM_TEXT" "$PROBLEMS_DIR" "$BUDGET")
+    PROMPT=$(printf "$PROMPT_TEMPLATE" "$PROBLEM_TEXT" "$PROBLEMS_DIR" "$TOKEN_BUDGET" "$WALL_BUDGET")
 
     # Get judge model from YAML (naive parse — assumes model: line follows judge name)
     MODEL=$(awk "/^  $JUDGE:/{found=1} found && /model:/{print \$2; exit}" "$JUDGES_FILE")
@@ -100,17 +112,26 @@ for PROBLEM in $PROBLEMS; do
 
     START_TIME=$(date +%s)
 
-    # Run hermes in oneshot mode, capture full output
-    hermes -z "$PROMPT" \
-      -m "$MODEL" \
-      --provider "$PROVIDER" \
-      -t terminal,file \
-      2>/dev/null > /tmp/bench_response.txt || true
+    # Run hermes under wall-clock timeout; capture full output
+    timeout "${WALL_BUDGET}" \
+      hermes -z "$PROMPT" \
+        -m "$MODEL" \
+        --provider "$PROVIDER" \
+        -t terminal,file \
+      2>/dev/null > /tmp/bench_response.txt || TIMED_OUT=$?
 
     RESPONSE=$(cat /tmp/bench_response.txt)
 
     END_TIME=$(date +%s)
     ELAPSED=$((END_TIME - START_TIME))
+
+    # Note if the run was killed by the wall-clock budget
+    KILLED_BY_TIMEOUT=false
+    if [[ "${TIMED_OUT:-0}" -eq 124 ]]; then
+      KILLED_BY_TIMEOUT=true
+      echo "  ⏱  Wall-clock budget exceeded (${WALL_BUDGET}s) — run terminated"
+    fi
+    unset TIMED_OUT
 
     # Extract solution.py if agent wrote it to /tmp/solution.py
     if [[ -f "/tmp/solution.py" ]]; then
@@ -129,6 +150,9 @@ result = {
     "judge": """$JUDGE""",
     "model": """$MODEL""",
     "elapsed_seconds": $ELAPSED,
+    "token_budget": $TOKEN_BUDGET,
+    "wall_budget": $WALL_BUDGET,
+    "killed_by_timeout": ${KILLED_BY_TIMEOUT},
     "response": open("/tmp/bench_response.txt").read() if __import__("os").path.exists("/tmp/bench_response.txt") else "",
     "solution": open("/tmp/bench_solution.py").read() if __import__("os").path.exists("/tmp/bench_solution.py") else "",
 }

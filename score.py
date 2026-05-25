@@ -113,6 +113,7 @@ def score_results(results_dir: str):
         model = data.get("model", "?")
         elapsed = data.get("elapsed_seconds", 0)
         solution = data.get("solution", "")
+        killed = data.get("killed_by_timeout", False)
 
         if problem in POETRY_PROBLEMS:
             # Poetry compression scoring
@@ -156,16 +157,16 @@ def score_results(results_dir: str):
             "expected": expected,
             "got": got,
             "score_type": score_type,
+            "killed": killed,
         })
 
     if not rows:
         print("No results found. Run ./run.sh first.")
         return
 
-    # Print leaderboard
     print("\n## hermes-judge-bench Leaderboard\n")
-    print(f"{'Problem':<10} {'Judge':<20} {'Model':<25} {'Elapsed':>8} {'Score':>10} {'Pareto':>8} {'Got':>20}")
-    print("-" * 115)
+    print(f"{'Problem':<10} {'Judge':<20} {'Model':<25} {'Elapsed':>8} {'Score':>10} {'Pareto':>8} {'Got':>20} {'':>6}")
+    print("-" * 120)
 
     std_rows = [r for r in rows if r["score_type"] == "standard"]
     poetry_rows = [r for r in rows if r["score_type"] == "poetry"]
@@ -174,20 +175,22 @@ def score_results(results_dir: str):
         print("\n### Standard Problems (correctness / log2(elapsed+2))\n")
         for r in sorted(std_rows, key=lambda x: -x["pareto_score"]):
             correct_str = "✓" if r["correctness"] == 1.0 else "✗"
+            timeout_str = "⏱TIMEOUT" if r.get("killed") else ""
             print(
                 f"{r['problem']:<10} {r['judge']:<20} {r['model']:<25} "
                 f"{r['elapsed_s']:>7}s {correct_str:>10} {r['pareto_score']:>8} "
-                f"{str(r['got']):>20}"
+                f"{str(r['got']):>20} {timeout_str:>6}"
             )
 
     if poetry_rows:
         print("\n### Poetry Compression Problems (compression_ratio / (1 + elapsed_s/60))\n")
         print("  Note: elapsed_seconds proxies token usage (true formula: cr / (1 + tokens/10000))\n")
         for r in sorted(poetry_rows, key=lambda x: -x["pareto_score"]):
+            timeout_str = "⏱TIMEOUT" if r.get("killed") else ""
             print(
                 f"{r['problem']:<10} {r['judge']:<20} {r['model']:<25} "
                 f"{r['elapsed_s']:>7}s {str(r['correctness']):>10} {r['pareto_score']:>8} "
-                f"{str(r['got']):>20}"
+                f"{str(r['got']):>20} {timeout_str:>6}"
             )
     print()
 

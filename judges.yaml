@@ -16,5 +16,6 @@ problems:
   - "001"
 
 budget:
-  max_turns: 10        # hard ceiling on agent tool-calling iterations
-  token_budget: 20000  # informational — passed to agent in prompt
+  token_budget: 20000  # informational — passed to agent in prompt; not enforced by hermes itself
+  wall_budget: 300     # hard ceiling in seconds — run.sh kills agent with `timeout` if exceeded
+                       # override per-run: ./run.sh --token-budget 50000 --wall-budget 600

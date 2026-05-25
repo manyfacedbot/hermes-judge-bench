@@ -32,12 +32,24 @@ score.py                # pareto scorer → markdown leaderboard
 # Poetry compression problems (all four categories, both judges)
 ./run.sh --problems 100,101,102,103 --judges bare,judge-face
 
+# With custom budgets
+./run.sh --problems 100,101,102,103 --judges bare,judge-face \
+  --token-budget 50000 --wall-budget 600
+
 # Score everything
 python3 score.py
 
 # Full run (all problems × all judges)
 ./run.sh
 ```
+
+**Budget defaults** (set in `judges.yaml`, overridable per-run):
+| Budget | Default | Flag | Enforcement |
+|---|---|---|---|
+| Token budget | 20,000 tokens | `--token-budget N` | Informational — told to agent in prompt |
+| Wall-clock | 300 seconds | `--wall-budget N` | Hard — `timeout` kills the agent process |
+
+Timed-out runs are marked `⏱TIMEOUT` in the leaderboard. The solution file is still saved if the agent wrote it before the cutoff.
 
 ---
 
