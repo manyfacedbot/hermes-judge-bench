@@ -1,39 +1,44 @@
 #!/usr/bin/env python3
 """
-zkp_eval.py — Evaluation harness for problem 200 (ZKP: Subset-Sum Partition).
+zkp_eval.py — Fully automated evaluation harness for problem 200 (ZKP: Subset-Sum Partition).
 
-Runs the agent's solution.py, evaluates:
-  1. Mechanical correctness (completeness + soundness empirically)
-  2. Qualitative ZK argument (scored 0-3 by the judge)
+Scoring (max 4.0, normalised to 1.0):
+  1. Completeness (1pt):  honest prover passes all rounds
+  2. Soundness   (2pt):  empirical cheat success rate ≤ 0.10 (+1) or ≤ 0.01 (+2)
+  3. Bound check (1pt):  soundness_bound(rounds) is a valid formula satisfying:
+                          - bound >= empirical soundness_error (not over-optimistic)
+                          - bound <= 1.0 (non-trivial)
+                          - bound(40) < bound(20) (decreasing with rounds — it's a formula)
 
-Returns JSON:
+All scoring is deterministic and requires no human input.
+
+Returns JSON to stdout:
   {
-    "mechanical_score": float,   # 0-3 (completeness 1pt + soundness 1-2pt)
-    "qualitative_score": float,  # 0-3 (judge-assigned)
-    "total_score": float,        # mechanical + qualitative (max 6, typical good = 4-5)
     "completeness_ok": bool,
     "soundness_error": float,
-    "zk_argument": str,
-    "errors": [str],
-    "notes": str
+    "soundness_bound_20": float,
+    "bound_correct": bool,
+    "bound_reason": str,
+    "mechanical_score": float,   # 0-4
+    "normalised": float,         # 0.0-1.0 (mechanical_score / 4.0)
+    "errors": [str]
   }
 
 Usage:
     python3 zkp_eval.py --solution /tmp/solution.py
-    python3 zkp_eval.py --solution /tmp/solution.py --judge-score 2.5
+    python3 zkp_eval.py --solution /tmp/solution.py --rounds 20 --cheat-trials 500
 """
 
 import argparse
 import importlib.util
 import json
 import os
-import random
-import subprocess
 import sys
 import traceback
 
-CHEAT_TRIALS = 500   # number of cheat attempts for soundness estimation
-HONEST_TRIALS = 10   # number of honest runs to verify completeness
+CHEAT_TRIALS_DEFAULT = 500
+HONEST_TRIALS = 10
+MAX_SCORE = 4.0
 
 
 def load_solution(path: str):
@@ -44,8 +49,9 @@ def load_solution(path: str):
     return mod
 
 
-def run_solution_stdout(path: str) -> dict:
+def run_stdout(path: str) -> dict:
     """Run solution as subprocess and parse its JSON stdout."""
+    import subprocess
     try:
         r = subprocess.run(
             ["python3", path],
@@ -62,213 +68,153 @@ def run_solution_stdout(path: str) -> dict:
         return {"error": str(e)}
 
 
-def evaluate_mechanical(solution_path: str) -> dict:
-    """
-    Evaluate mechanical correctness:
-    - Load and parse the solution's stdout JSON
-    - Re-run completeness test using the solution's own prove() function
-    - Run soundness test using the solution's own cheat_attempt() function
-    """
+def evaluate(solution_path: str, rounds: int, cheat_trials: int) -> dict:
     result = {
         "completeness_ok": False,
         "soundness_error": 1.0,
-        "zk_argument": "",
-        "test_case": {},
-        "errors": [],
+        "soundness_bound_20": None,
+        "bound_correct": False,
+        "bound_reason": "",
         "mechanical_score": 0.0,
+        "normalised": 0.0,
+        "errors": [],
     }
 
-    # Step 1: get the solution's self-reported output
-    stdout_data = run_solution_stdout(solution_path)
+    # --- Step 1: run solution to get self-reported output + test_case ---
+    stdout_data = run_stdout(solution_path)
     if "error" in stdout_data:
-        result["errors"].append(f"Solution stdout error: {stdout_data['error']}")
+        result["errors"].append(f"stdout error: {stdout_data['error']}")
         return result
 
-    result["zk_argument"] = stdout_data.get("zk_argument", "")
-    result["test_case"] = stdout_data.get("test_case", {})
-    self_reported_completeness = stdout_data.get("completeness_ok", False)
-    self_reported_soundness = stdout_data.get("soundness_error", 1.0)
-
-    # Step 2: independently verify by importing and calling prove() / cheat_attempt()
-    try:
-        mod = load_solution(solution_path)
-    except Exception as e:
-        result["errors"].append(f"Failed to import solution: {traceback.format_exc()}")
-        return result
-
-    # Check required functions exist
-    for fn in ["prove", "cheat_attempt"]:
-        if not hasattr(mod, fn):
-            result["errors"].append(f"Missing function: {fn}()")
-            return result
-
-    # Extract test case
-    tc = result["test_case"]
+    tc = stdout_data.get("test_case", {})
     S = tc.get("S", [])
     A = tc.get("A", [])
     B = tc.get("B", [])
 
     if not S or not A or not B:
-        result["errors"].append("test_case missing S, A, or B")
+        result["errors"].append("test_case missing S, A, or B in stdout JSON")
         return result
 
     if len(S) < 10:
-        result["errors"].append(f"S has only {len(S)} elements — need ≥ 10")
+        result["errors"].append(f"|S| = {len(S)} < 10")
 
-    # Verify the partition is actually valid
     if sorted(A + B) != sorted(S):
-        result["errors"].append("A ∪ B ≠ S — partition is invalid")
-        return result
-    if sum(A) != sum(B):
-        result["errors"].append(f"sum(A)={sum(A)} ≠ sum(B)={sum(B)} — not a valid partition")
+        result["errors"].append("A ∪ B ≠ S — invalid partition")
         return result
 
-    # Step 3: completeness — run prove() HONEST_TRIALS times, all must pass
+    if sum(A) != sum(B):
+        result["errors"].append(f"sum(A)={sum(A)} ≠ sum(B)={sum(B)}")
+        return result
+
+    # --- Step 2: import module, check required functions ---
+    try:
+        mod = load_solution(solution_path)
+    except Exception:
+        result["errors"].append(f"import failed:\n{traceback.format_exc()}")
+        return result
+
+    for fn in ["prove", "cheat_attempt", "soundness_bound"]:
+        if not hasattr(mod, fn):
+            result["errors"].append(f"missing function: {fn}()")
+            return result
+
+    # --- Step 3: completeness ---
     completeness_passes = 0
     for _ in range(HONEST_TRIALS):
         try:
-            r = mod.prove(S, (A, B), rounds=20)
+            r = mod.prove(S, (A, B), rounds=rounds)
             if r:
                 completeness_passes += 1
         except Exception as e:
-            result["errors"].append(f"prove() raised exception: {e}")
+            result["errors"].append(f"prove() exception: {e}")
             break
-
     result["completeness_ok"] = (completeness_passes == HONEST_TRIALS)
 
-    # Step 4: soundness — run cheat_attempt() CHEAT_TRIALS times
+    # --- Step 4: soundness (empirical) ---
     cheat_passes = 0
-    try:
-        # Try batch first (faster if solution supports it)
-        cheat_result = mod.cheat_attempt(S, rounds=20)
-        if isinstance(cheat_result, float):
-            # Solution returned a fraction directly
-            result["soundness_error"] = cheat_result
-        elif isinstance(cheat_result, bool):
-            # Single trial — run many
-            passes = 1 if cheat_result else 0
-            for _ in range(CHEAT_TRIALS - 1):
-                try:
-                    if mod.cheat_attempt(S, rounds=20):
-                        passes += 1
-                except Exception:
-                    pass
-            result["soundness_error"] = passes / CHEAT_TRIALS
-        else:
-            result["soundness_error"] = float(cheat_result)
-    except Exception as e:
-        result["errors"].append(f"cheat_attempt() raised exception: {e}")
-        result["soundness_error"] = 1.0
+    for _ in range(cheat_trials):
+        try:
+            r = mod.cheat_attempt(S, rounds=rounds)
+            if isinstance(r, bool):
+                if r:
+                    cheat_passes += 1
+            elif isinstance(r, (int, float)):
+                # If the function returned a rate directly, use it and break
+                result["soundness_error"] = float(r)
+                cheat_passes = -1  # sentinel
+                break
+            else:
+                result["errors"].append(f"cheat_attempt() returned unexpected type: {type(r)}")
+                break
+        except Exception as e:
+            result["errors"].append(f"cheat_attempt() exception: {e}")
+            break
 
-    # Step 5: compute mechanical score
+    if cheat_passes != -1:
+        result["soundness_error"] = cheat_passes / cheat_trials
+
+    se = result["soundness_error"]
+
+    # --- Step 5: soundness_bound check ---
+    try:
+        b20 = float(mod.soundness_bound(rounds))
+        b40 = float(mod.soundness_bound(rounds * 2))
+        result["soundness_bound_20"] = b20
+
+        reasons = []
+        ok = True
+
+        if b20 < se:
+            ok = False
+            reasons.append(
+                f"bound({rounds})={b20:.6f} < empirical error {se:.6f} — over-optimistic"
+            )
+        if b20 >= 1.0:
+            ok = False
+            reasons.append(f"bound({rounds})={b20:.6f} ≥ 1.0 — trivial/non-informative")
+        if b40 >= b20:
+            ok = False
+            reasons.append(
+                f"bound({rounds*2})={b40:.6f} ≥ bound({rounds})={b20:.6f} — not decreasing with rounds"
+            )
+
+        result["bound_correct"] = ok
+        result["bound_reason"] = "; ".join(reasons) if reasons else "valid"
+
+    except Exception as e:
+        result["errors"].append(f"soundness_bound() exception: {e}")
+        result["bound_reason"] = f"exception: {e}"
+
+    # --- Step 6: compute total score ---
     score = 0.0
     if result["completeness_ok"]:
         score += 1.0
-    se = result["soundness_error"]
-    if se <= 0.10:
-        score += 1.0
     if se <= 0.01:
-        score += 1.0  # bonus for tight soundness
-
-    # Penalise missing or too-short ZK argument
-    zk_arg = result["zk_argument"]
-    if not zk_arg or len(zk_arg.split()) < 50:
-        result["errors"].append("zk_argument too short (< 50 words) — qualitative score will be 0")
+        score += 2.0
+    elif se <= 0.10:
+        score += 1.0
+    if result["bound_correct"]:
+        score += 1.0
 
     result["mechanical_score"] = score
+    result["normalised"] = score / MAX_SCORE
     return result
-
-
-def qualitative_rubric() -> str:
-    return """
-JUDGE EVALUATION RUBRIC — ZKP Zero-Knowledge Argument (0–3 points)
-
-Read the agent's `zk_argument` field carefully. Score it 0–3:
-
-3 points — GENUINE ZK:
-  - Describes a concrete simulator that produces valid transcripts without the witness
-  - Explains WHY simulator transcripts are indistinguishable from real transcripts
-  - Identifies the specific hiding property of the commitment scheme used
-  - Notes any caveats (e.g. computational vs statistical ZK, random oracle assumptions)
-
-2 points — PARTIAL ZK:
-  - Correct intuition but missing the simulator description
-  - OR: correctly describes what the verifier sees but doesn't argue indistinguishability
-  - OR: valid argument but with one identifiable gap or unstated assumption
-
-1 point — WEAK / HAND-WAVY:
-  - Claims ZK because "verifier only sees commitments" without explaining hiding property
-  - OR: describes the protocol correctly but makes no ZK argument
-  - OR: confuses ZK with soundness or completeness
-
-0 points — WRONG or ABSENT:
-  - No ZK argument provided
-  - Argument is demonstrably incorrect (e.g. commitment scheme is not hiding)
-  - Circular reasoning ("it's ZK because the prover doesn't reveal A and B")
-
-IMPORTANT: A commitment scheme using hash(value) with no random blinding is NOT hiding.
-If the agent uses such a scheme, the ZK claim is false regardless of how it's argued.
-"""
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--solution", required=True)
-    parser.add_argument("--judge-score", type=float, default=None,
-                        help="Qualitative judge score 0-3 (if omitted, prints rubric and exits)")
+    parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--cheat-trials", type=int, default=CHEAT_TRIALS_DEFAULT)
     args = parser.parse_args()
 
     if not os.path.exists(args.solution):
-        print(json.dumps({"error": f"Solution not found: {args.solution}"}))
+        print(json.dumps({"error": f"not found: {args.solution}"}))
         sys.exit(1)
 
-    print("Evaluating mechanical correctness...", file=sys.stderr)
-    mech = evaluate_mechanical(args.solution)
-
-    if args.judge_score is None:
-        # Print mechanical results + rubric for human/judge evaluation
-        print("\n" + "="*60, file=sys.stderr)
-        print("MECHANICAL RESULTS", file=sys.stderr)
-        print("="*60, file=sys.stderr)
-        print(f"  Completeness : {'✓' if mech['completeness_ok'] else '✗'}", file=sys.stderr)
-        print(f"  Soundness err: {mech['soundness_error']:.4f}", file=sys.stderr)
-        print(f"  Mech score   : {mech['mechanical_score']:.1f} / 3.0", file=sys.stderr)
-        if mech["errors"]:
-            print(f"  Errors       : {mech['errors']}", file=sys.stderr)
-        print(f"\nZK ARGUMENT:\n{mech['zk_argument']}", file=sys.stderr)
-        print(qualitative_rubric(), file=sys.stderr)
-        print("\nRe-run with --judge-score N to record final result.", file=sys.stderr)
-
-        # Still output partial JSON so score.py can use mechanical score
-        result = {
-            "mechanical_score": mech["mechanical_score"],
-            "qualitative_score": None,
-            "total_score": mech["mechanical_score"],
-            "completeness_ok": mech["completeness_ok"],
-            "soundness_error": mech["soundness_error"],
-            "zk_argument": mech["zk_argument"],
-            "errors": mech["errors"],
-            "notes": "qualitative_score pending judge evaluation",
-        }
-        print(json.dumps(result, indent=2))
-        sys.exit(0)
-
-    # Judge score provided — compute final result
-    qual_score = max(0.0, min(3.0, args.judge_score))
-    total = mech["mechanical_score"] + qual_score
-
-    result = {
-        "mechanical_score": mech["mechanical_score"],
-        "qualitative_score": qual_score,
-        "total_score": total,
-        "completeness_ok": mech["completeness_ok"],
-        "soundness_error": mech["soundness_error"],
-        "zk_argument": mech["zk_argument"],
-        "errors": mech["errors"],
-        "notes": f"max possible: 6.0 (3 mechanical + 3 qualitative)",
-    }
+    result = evaluate(args.solution, args.rounds, args.cheat_trials)
     print(json.dumps(result, indent=2))
-    sys.exit(0 if mech["completeness_ok"] else 1)
+    sys.exit(0 if result["completeness_ok"] else 1)
 
 
 if __name__ == "__main__":
