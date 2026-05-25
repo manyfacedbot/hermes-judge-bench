@@ -91,13 +91,20 @@ def read_judge_config(judges_file: str, judge_name: str) -> dict:
     return {"model": model, "provider": provider}
 
 
-def run_hermes(prompt: str, model: str, provider: str, solution_path: str) -> dict:
+def run_hermes(prompt: str, model: str, provider: str, solution_path: str, token_limit: int = 0) -> dict:
     """
     Run hermes -z with the given prompt. Returns token counts.
     solution_path: where to copy /tmp/solution.py after the run.
+    token_limit: if > 0, passed as wall-budget approximation via prompt only (hermes has no hard token cutoff flag).
     """
     env = os.environ.copy()
+
+    # Pass remaining budget as a hard wall-clock timeout proxy:
+    # approximate 1000 tokens ≈ 10 seconds of inference; floor at 30s
+    wall_timeout = max(30, (token_limit // 100)) if token_limit > 0 else 300
+
     cmd = [
+        "timeout", str(wall_timeout),
         "hermes", "-z", prompt,
         "-m", model,
         "--provider", provider,
@@ -285,7 +292,7 @@ def run_tournament(
         sol_a_path = os.path.join(dir_a, f"300-round{rnd:02d}-solution.py")
         print(f"  Running agent A ({judge_a})...")
         if budget_a > 0:
-            tok_a = run_hermes(prompt_a, config_a["model"], config_a["provider"], sol_a_path)
+            tok_a = run_hermes(prompt_a, config_a["model"], config_a["provider"], sol_a_path, token_limit=budget_a)
             spent_a = tok_a["raw_tokens"]
             budget_a = max(0, budget_a - spent_a)
             if os.path.exists(sol_a_path):
@@ -310,7 +317,7 @@ def run_tournament(
         sol_b_path = os.path.join(dir_b, f"300-round{rnd:02d}-solution.py")
         print(f"  Running agent B ({judge_b})...")
         if budget_b > 0:
-            tok_b = run_hermes(prompt_b, config_b["model"], config_b["provider"], sol_b_path)
+            tok_b = run_hermes(prompt_b, config_b["model"], config_b["provider"], sol_b_path, token_limit=budget_b)
             spent_b = tok_b["raw_tokens"]
             budget_b = max(0, budget_b - spent_b)
             if os.path.exists(sol_b_path):
