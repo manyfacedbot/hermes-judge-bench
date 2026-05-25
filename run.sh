@@ -24,8 +24,8 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROBLEMS_DIR="$REPO_DIR/problems"
 RESULTS_DIR="$REPO_DIR/results"
 JUDGES_FILE="$REPO_DIR/judges.yaml"
-TOKEN_BUDGET=20000   # informational — told to agent; not enforced by hermes itself
-WALL_BUDGET=300      # hard — enforced via timeout(1); exit 124 = killed
+TOKEN_BUDGET=""    # if empty, no token budget is stated in the prompt
+WALL_BUDGET=""     # if empty, no wall-clock limit is enforced
 
 # Cache token weight for scoring: cache_read_tokens count at this fraction of a full token.
 # Anthropic prompt caching cannot be disabled in Hermes (hard-coded auto-detect).
@@ -91,8 +91,9 @@ Rules:
 - Any data files referenced in the problem are available at %s/
 - You may iterate on your script as many times as needed.
 - Run your script with: python3 /tmp/solution.py
-- When you are confident your answer is correct, stop and say DONE.
+- When you are confident your answer is correct, stop and say DONE.'
 
+PROMPT_BUDGET_ADDENDUM='
 Hard limits (enforced externally — you will be cut off if you exceed either):
   Token budget : %d tokens (input + output combined)
   Wall-clock   : %d seconds
@@ -103,8 +104,8 @@ beats a better answer that is cut off mid-run.'
 echo ""
 echo "=== hermes-judge-bench ==="
 echo "Heat         : $HEAT_ID"
-echo "Token budget : ${TOKEN_BUDGET} tokens"
-echo "Wall budget  : ${WALL_BUDGET}s"
+echo "Token budget : ${TOKEN_BUDGET:-"(none — unstated)"}"
+echo "Wall budget  : ${WALL_BUDGET:-"(none — no timeout)"}"
 echo "Cache weight : ${CACHE_READ_WEIGHT} (cache_read_tokens counted at this fraction)"
 echo "Problems : $(echo $PROBLEMS | tr '\n' ' ')"
 echo "Judges   : $(echo $JUDGES | tr '\n' ' ')"
@@ -130,8 +131,11 @@ for PROBLEM in $PROBLEMS; do
 
     echo "Running: problem=$PROBLEM judge=$JUDGE  →  $JUDGE_DIR/"
 
-    # Build prompt
-    PROMPT=$(printf "$PROMPT_TEMPLATE" "$PROBLEM_TEXT" "$PROBLEMS_DIR" "$TOKEN_BUDGET" "$WALL_BUDGET")
+    # Build prompt — append budget addendum only if both limits are set
+    PROMPT=$(printf "$PROMPT_TEMPLATE" "$PROBLEM_TEXT" "$PROBLEMS_DIR")
+    if [[ -n "$TOKEN_BUDGET" && -n "$WALL_BUDGET" ]]; then
+      PROMPT="${PROMPT}$(printf "$PROMPT_BUDGET_ADDENDUM" "$TOKEN_BUDGET" "$WALL_BUDGET")"
+    fi
 
     # Get judge model/provider from YAML
     MODEL=$(awk "/^  $JUDGE:/{found=1} found && /model:/{print \$2; exit}" "$JUDGES_FILE")
@@ -139,13 +143,21 @@ for PROBLEM in $PROBLEMS; do
 
     START_TIME=$(date +%s)
 
-    # Run hermes under wall-clock timeout
-    timeout "${WALL_BUDGET}" \
+    # Run hermes — with or without wall-clock timeout
+    if [[ -n "$WALL_BUDGET" ]]; then
+      timeout "${WALL_BUDGET}" \
+        hermes -z "$PROMPT" \
+          -m "$MODEL" \
+          --provider "$PROVIDER" \
+          -t terminal,file \
+        2>/dev/null > "$RESPONSE_FILE" || TIMED_OUT=$?
+    else
       hermes -z "$PROMPT" \
         -m "$MODEL" \
         --provider "$PROVIDER" \
         -t terminal,file \
-      2>/dev/null > "$RESPONSE_FILE" || TIMED_OUT=$?
+        2>/dev/null > "$RESPONSE_FILE" || true
+    fi
 
     END_TIME=$(date +%s)
     ELAPSED=$((END_TIME - START_TIME))
@@ -198,8 +210,10 @@ out   = int(sys.argv[9])
 cr    = int(sys.argv[10])
 cw    = int(sys.argv[11])
 wt    = float(sys.argv[12])
-# effective tokens = input + output + cache_read * weight
 effective = inp + out + round(cr * wt)
+
+tok_budget  = int(sys.argv[6])  if sys.argv[6]  else None
+wall_budget = int(sys.argv[7])  if sys.argv[7]  else None
 
 result = {
     'heat':               sys.argv[1],
@@ -207,8 +221,8 @@ result = {
     'judge':              sys.argv[3],
     'model':              sys.argv[4],
     'elapsed_seconds':    int(sys.argv[5]),
-    'token_budget':       int(sys.argv[6]),
-    'wall_budget':        int(sys.argv[7]),
+    'token_budget':       tok_budget,
+    'wall_budget':        wall_budget,
     'killed_by_timeout':  sys.argv[15] == 'true',
     'input_tokens':       inp,
     'output_tokens':      out,
