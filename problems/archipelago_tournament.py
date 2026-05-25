@@ -194,7 +194,16 @@ def build_prompt(
     my_colour_hint: str,
     went_first_last: bool | None,
 ) -> str:
+    token_tracking = (
+        "**Token tracking:** You can check your current session's token usage at any time by running:\n"
+        "```bash\n"
+        "bash /home/hermes/hermes-judge-bench/problems/check_tokens.sh\n"
+        "```\n"
+        "This prints `raw_tokens` (input + output) spent so far this round. "
+        "Check it before deciding whether to keep iterating or say DONE.\n"
+    )
     budget_note = (
+        f"{token_tracking}\n"
         f"**Token budget:** You have {budget_remaining:,} tokens remaining out of {total_budget:,} total "
         f"across all {20} rounds. This is round {round_num}/20 — you have {rounds_remaining} rounds left after this. "
         f"Spending 0 tokens this round preserves your budget but keeps your current bot unchanged. "
