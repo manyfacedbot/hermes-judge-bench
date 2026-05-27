@@ -91,20 +91,27 @@ def read_judge_config(judges_file: str, judge_name: str) -> dict:
     return {"model": model, "provider": provider}
 
 
-def run_hermes(prompt: str, model: str, provider: str, solution_path: str, token_limit: int = 0) -> dict:
+def run_hermes(prompt: str, model: str, provider: str, solution_path: str, token_limit: int = 0, log_path: str = "") -> dict:
     """
     Run hermes -z with the given prompt. Returns token counts.
     solution_path: where to copy /tmp/solution.py after the run.
-    token_limit: if > 0, passed as wall-budget approximation via prompt only (hermes has no hard token cutoff flag).
+    token_limit: remaining budget (soft cap, informational).
+    log_path: where to write the agent's final response text.
     """
     env = os.environ.copy()
+    env["HERMES_EXEC_ASK"] = "0"      # never prompt for terminal approval
+    env["HERMES_YOLO_MODE"] = "1"     # auto-approve dangerous commands
+    env["HERMES_ACCEPT_HOOKS"] = "1"  # auto-approve shell hooks
 
-    # Pass remaining budget as a hard wall-clock timeout proxy:
-    # approximate 1000 tokens ≈ 10 seconds of inference; floor at 30s
-    wall_timeout = max(30, (token_limit // 100)) if token_limit > 0 else 300
+    # Write the round's token budget to a file so check_tokens.sh can compute tokens_remaining
+    budget_file = "/tmp/archipelago_budget"
+    if token_limit > 0:
+        with open(budget_file, "w") as bf:
+            bf.write(str(token_limit))
+    elif os.path.exists(budget_file):
+        os.remove(budget_file)
 
     cmd = [
-        "timeout", str(wall_timeout),
         "hermes", "-z", prompt,
         "-m", model,
         "--provider", provider,
@@ -114,6 +121,15 @@ def run_hermes(prompt: str, model: str, provider: str, solution_path: str, token
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
     elapsed = int(time.time() - t0)
+
+    # Write agent response to log file
+    if log_path:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w") as lf:
+            lf.write(f"=== model={model} provider={provider} budget={token_limit} elapsed={elapsed}s exit={result.returncode} ===\n\n")
+            lf.write(result.stdout or "")
+            if result.stderr:
+                lf.write(f"\n=== STDERR ===\n{result.stderr}")
 
     # Copy solution if written
     if os.path.exists("/tmp/solution.py"):
@@ -150,7 +166,8 @@ def run_hermes(prompt: str, model: str, provider: str, solution_path: str, token
         "cache_read_tokens": cache_read_tokens,
         "raw_tokens": raw_tokens,
         "elapsed_seconds": elapsed,
-        "response": result.stdout,
+        "exit_code": result.returncode,
+        "solution_written": os.path.exists(solution_path),
     }
 
 
@@ -199,7 +216,7 @@ def build_prompt(
         "```bash\n"
         "bash /home/hermes/hermes-judge-bench/problems/check_tokens.sh\n"
         "```\n"
-        "This prints `raw_tokens` (input + output) spent so far this round. "
+        "This prints `tokens_spent` and `tokens_remaining` for this round. "
         "Check it before deciding whether to keep iterating or say DONE.\n"
     )
     budget_note = (
@@ -207,7 +224,12 @@ def build_prompt(
         f"**Token budget:** You have {budget_remaining:,} tokens remaining out of {total_budget:,} total "
         f"across all {20} rounds. This is round {round_num}/20 — you have {rounds_remaining} rounds left after this. "
         f"Spending 0 tokens this round preserves your budget but keeps your current bot unchanged. "
-        f"The agent that spends fewer tokens this round goes first (Red)."
+        f"The agent that spends fewer tokens this round goes first (Red).\n\n"
+        f"**Overflow rule:** The budget is a soft cap. If a single inference takes you over budget, "
+        f"that inference is allowed to complete, but you are immediately **locked out** — "
+        f"no further generation in any future round. Whatever code was written (even if incomplete) "
+        f"becomes your permanent bot. Use this strategically: a big final inference is a gamble "
+        f"— you can't verify the output or fix bugs afterward."
     )
 
     base = f"""You are playing a strategy game called Archipelago against another agent.
@@ -263,6 +285,8 @@ def run_tournament(
 
     budget_a = token_budget
     budget_b = token_budget
+    locked_a = False   # True once an agent overflows their budget (soft cap with lockout)
+    locked_b = False
 
     bot_a_path = os.path.join(dir_a, "300-bot-current.py")
     bot_b_path = os.path.join(dir_b, "300-bot-current.py")
@@ -287,7 +311,9 @@ def run_tournament(
 
     for rnd in range(1, rounds + 1):
         print(f"\n{'='*60}")
-        print(f"ROUND {rnd}/{rounds}  |  budget_a={budget_a:,}  budget_b={budget_b:,}")
+        print(f"ROUND {rnd}/{rounds}  |  budget_a={budget_a:,}  budget_b={budget_b:,}"
+              + ("  [A LOCKED]" if locked_a else "")
+              + ("  [B LOCKED]" if locked_b else ""))
         print(f"{'='*60}")
 
         prev_str_a = format_round_results(round_results, colour_history_a) if round_results else ""
@@ -300,15 +326,22 @@ def run_tournament(
         )
         sol_a_path = os.path.join(dir_a, f"300-round{rnd:02d}-solution.py")
         print(f"  Running agent A ({judge_a})...")
-        if budget_a > 0:
-            tok_a = run_hermes(prompt_a, config_a["model"], config_a["provider"], sol_a_path, token_limit=budget_a)
+        if not locked_a and budget_a > 0:  # budget goes negative on overflow; lock on next round
+            tok_a = run_hermes(prompt_a, config_a["model"], config_a["provider"], sol_a_path,
+                               token_limit=budget_a,
+                               log_path=os.path.join(dir_a, f"300-round{rnd:02d}-agent.log"))
             spent_a = tok_a["raw_tokens"]
-            budget_a = max(0, budget_a - spent_a)
+            overflowed_a = spent_a > budget_a
+            budget_before_a = budget_a
+            budget_a = budget_a - spent_a  # allow negative; lockout applied next round
+            if overflowed_a:
+                locked_a = True
+                print(f"    Agent A BUDGET OVERFLOW ({spent_a:,} spent, budget was {budget_before_a:,}) — LOCKED OUT")
             if os.path.exists(sol_a_path):
                 new_bot = load_bot(sol_a_path)
                 if new_bot:
                     bot_a = new_bot
-                    print(f"    Agent A revised bot ({spent_a:,} tokens spent, {budget_a:,} remaining)")
+                    print(f"    Agent A revised bot ({spent_a:,} tokens spent, {budget_a:,} remaining{', LOCKED' if locked_a else ''})")
                 else:
                     print(f"    Agent A wrote file but no valid choose_move — keeping previous bot")
             else:
@@ -316,7 +349,10 @@ def run_tournament(
         else:
             spent_a = 0
             tok_a = {"raw_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "elapsed_seconds": 0}
-            print(f"    Agent A budget exhausted — keeping previous bot")
+            if locked_a:
+                print(f"    Agent A locked out (budget overflowed) — keeping previous bot")
+            else:
+                print(f"    Agent A budget exhausted — keeping previous bot")
 
         # --- Agent B writes its bot ---
         prompt_b = build_prompt(
@@ -325,15 +361,22 @@ def run_tournament(
         )
         sol_b_path = os.path.join(dir_b, f"300-round{rnd:02d}-solution.py")
         print(f"  Running agent B ({judge_b})...")
-        if budget_b > 0:
-            tok_b = run_hermes(prompt_b, config_b["model"], config_b["provider"], sol_b_path, token_limit=budget_b)
+        if not locked_b and budget_b > 0:  # budget goes negative on overflow; lock on next round
+            tok_b = run_hermes(prompt_b, config_b["model"], config_b["provider"], sol_b_path,
+                               token_limit=budget_b,
+                               log_path=os.path.join(dir_b, f"300-round{rnd:02d}-agent.log"))
             spent_b = tok_b["raw_tokens"]
-            budget_b = max(0, budget_b - spent_b)
+            overflowed_b = spent_b > budget_b
+            budget_before_b = budget_b
+            budget_b = budget_b - spent_b  # allow negative; lockout applied next round
+            if overflowed_b:
+                locked_b = True
+                print(f"    Agent B BUDGET OVERFLOW ({spent_b:,} spent, budget was {budget_before_b:,}) — LOCKED OUT")
             if os.path.exists(sol_b_path):
                 new_bot = load_bot(sol_b_path)
                 if new_bot:
                     bot_b = new_bot
-                    print(f"    Agent B revised bot ({spent_b:,} tokens spent, {budget_b:,} remaining)")
+                    print(f"    Agent B revised bot ({spent_b:,} tokens spent, {budget_b:,} remaining{', LOCKED' if locked_b else ''})")
                 else:
                     print(f"    Agent B wrote file but no valid choose_move — keeping previous bot")
             else:
@@ -341,7 +384,10 @@ def run_tournament(
         else:
             spent_b = 0
             tok_b = {"raw_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "elapsed_seconds": 0}
-            print(f"    Agent B budget exhausted — keeping previous bot")
+            if locked_b:
+                print(f"    Agent B locked out (budget overflowed) — keeping previous bot")
+            else:
+                print(f"    Agent B budget exhausted — keeping previous bot")
 
         # --- Determine who goes first (Red) ---
         if spent_a < spent_b:
@@ -388,6 +434,8 @@ def run_tournament(
             "spent_b": spent_b,
             "budget_remaining_a": budget_a,
             "budget_remaining_b": budget_b,
+            "locked_a": locked_a,
+            "locked_b": locked_b,
             "colour_a": colour_a,
             "colour_b": colour_b,
             "round_winner": round_winner_agent,
