@@ -148,10 +148,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     args = parser.parse_args()
 
-    # Resolve relative paths from this script's directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    corpus_path = args.corpus if os.path.isabs(args.corpus) else os.path.join(script_dir, args.corpus)
-    solution_path = args.solution if os.path.isabs(args.solution) else os.path.abspath(args.solution)
+    # Resolve relative paths against the caller's CWD (standard tool semantics).
+    corpus_path = os.path.abspath(args.corpus)
+    solution_path = os.path.abspath(args.solution)
 
     result = run_eval(corpus_path, solution_path, n=args.n, seed=args.seed)
     print(json.dumps(result, indent=2))

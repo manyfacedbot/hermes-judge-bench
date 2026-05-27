@@ -101,45 +101,15 @@ def run_poetry_eval(solution_py: str, problem: str) -> dict:
         return {"verified": False, "compression_ratio": 0.0, "error": str(e)}
 
 
-def find_result_files(results_dir: str, heat_filter: str | None) -> list[str]:
-    """Find all *-result.json files, optionally filtered to a specific heat."""
-    if heat_filter:
-        pattern = os.path.join(results_dir, heat_filter, "*", "*-result.json")
-    else:
-        # Both new heat structure and legacy flat structure
-        pattern_heat = os.path.join(results_dir, "heat_*", "*", "*-result.json")
-        pattern_flat = os.path.join(results_dir, "*.json")
-        files = glob.glob(pattern_heat) + [
-            f for f in glob.glob(pattern_flat)
-            if "solution" not in os.path.basename(f)
-            and "result" not in os.path.basename(f).split("-")[-1].replace(".json", "")
-            # legacy: NNN-judge.json files (no 'result' suffix)
-            or (os.path.basename(f).endswith(".json")
-                and "solution" not in os.path.basename(f)
-                and not os.path.basename(f).startswith("heat_"))
-        ]
-        return sorted(set(files))
-    return sorted(glob.glob(pattern))
-
-
 def score_results(results_dir: str, heat_filter: str | None):
     answers = load_answers()
     rows = []
 
-    # Find result files — handle both heat structure and legacy flat structure
     if heat_filter:
-        result_files = sorted(glob.glob(
-            os.path.join(results_dir, heat_filter, "*", "*-result.json")
-        ))
+        pattern = os.path.join(results_dir, heat_filter, "*", "*-result.json")
     else:
-        result_files = sorted(glob.glob(
-            os.path.join(results_dir, "heat_*", "*", "*-result.json")
-        ))
-        # Also pick up legacy flat results (NNN-judge.json, no 'result' or 'solution' in name)
-        for f in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
-            bn = os.path.basename(f)
-            if "solution" not in bn and not bn.endswith("-result.json"):
-                result_files.append(f)
+        pattern = os.path.join(results_dir, "heat_*", "*", "*-result.json")
+    result_files = sorted(glob.glob(pattern))
 
     if not result_files:
         print("No results found. Run ./run.sh first.")
@@ -194,8 +164,8 @@ def score_results(results_dir: str, heat_filter: str | None):
             except Exception as e:
                 correctness = 0.0
                 got = f"error: {e}"
-            if total_tokens > 0:
-                pareto = correctness / (1 + total_tokens / 10000)
+            if eff_tok > 0:
+                pareto = correctness / (1 + eff_tok / 10000)
                 token_note = f"{raw_tok}+{cache_r}cr"
             else:
                 pareto = correctness / (1 + elapsed / 60)
@@ -221,7 +191,12 @@ def score_results(results_dir: str, heat_filter: str | None):
         elif problem == "000":
             output = extract_answer(solution, problem)
             correctness = 1.0 if output else 0.0
-            pareto = correctness / math.log2(elapsed + 2)
+            if eff_tok > 0:
+                pareto = correctness / (1 + eff_tok / 10000)
+                token_note = f"{raw_tok}+{cache_r}cr"
+            else:
+                pareto = correctness / (1 + elapsed / 60)
+                token_note = f"{elapsed}s~"
             expected = "(haiku)"
             got = output or "—"
             score_type = "standard"
@@ -236,7 +211,12 @@ def score_results(results_dir: str, heat_filter: str | None):
                 output = extract_answer(solution, problem)
                 correctness = 1.0 if output and output.strip() == expected.strip() else 0.0
                 got = output or "—"
-            pareto = correctness / math.log2(elapsed + 2)
+            if eff_tok > 0:
+                pareto = correctness / (1 + eff_tok / 10000)
+                token_note = f"{raw_tok}+{cache_r}cr"
+            else:
+                pareto = correctness / (1 + elapsed / 60)
+                token_note = f"{elapsed}s~"
             score_type = "standard"
 
         rows.append({
@@ -268,14 +248,15 @@ def score_results(results_dir: str, heat_filter: str | None):
     print(f"\n## hermes-judge-bench Leaderboard — {title}\n")
 
     if std_rows:
-        print("### Standard Problems  (correctness / log2(elapsed+2))\n")
-        print(f"{'Heat':<22} {'Problem':<10} {'Judge':<20} {'Model':<25} {'Elapsed':>8} {'Score':>8} {'Pareto':>8} {'Got':>14} {'':>8}")
-        print("-" * 130)
+        print("### Standard Problems  (correctness / (1 + effective_tokens/10000))\n")
+        print("  Tokens column: raw_input+output + cache_reads (cr). '~' = elapsed proxy (legacy).\n")
+        print(f"{'Heat':<22} {'Problem':<10} {'Judge':<20} {'Model':<25} {'Tokens':>14} {'Score':>8} {'Pareto':>8} {'Got':>14} {'':>8}")
+        print("-" * 140)
         for r in sorted(std_rows, key=lambda x: -x["pareto_score"]):
             c = "✓" if r["correctness"] == 1.0 else "✗"
             t = "⏱" if r.get("killed") else ""
             print(f"{r['heat']:<22} {r['problem']:<10} {r['judge']:<20} {r['model']:<25} "
-                  f"{r['elapsed_s']:>7}s {c:>8} {r['pareto_score']:>8} {str(r['got']):>14} {t:>8}")
+                  f"{str(r['token_note']):>14} {c:>8} {r['pareto_score']:>8} {str(r['got']):>14} {t:>8}")
 
     if poetry_rows:
         print("\n### Poetry Compression  (compression_ratio / (1 + effective_tokens/10000))\n")

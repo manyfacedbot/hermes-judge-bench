@@ -71,6 +71,11 @@ def _flood_fill_from_outside(board: list[list[str]], blocked_colour: str) -> set
 def score(board: list[list[str]]) -> dict[str, int]:
     """
     Returns {"R": int, "B": int} — total scores for each player.
+
+    Bonus: an empty cell scores +2 for player C only when reaching it from
+    outside the board REQUIRES crossing C's stones AND a path exists that
+    crosses no stones of the other colour. Cells walled off by both colours
+    award no bonus to either (no player alone is doing the enclosing).
     """
     scores = {RED: 0, BLUE: 0}
 
@@ -80,13 +85,20 @@ def score(board: list[list[str]]) -> dict[str, int]:
             if board[r][c] in (RED, BLUE):
                 scores[board[r][c]] += 1
 
-    # Enclosed empty cells
-    for colour in (RED, BLUE):
-        reachable = _flood_fill_from_outside(board, colour)
-        for r in range(ROWS):
-            for c in range(COLS):
-                if board[r][c] == EMPTY and (r, c) not in reachable:
-                    scores[colour] += 2
+    reachable_blocking_red  = _flood_fill_from_outside(board, RED)
+    reachable_blocking_blue = _flood_fill_from_outside(board, BLUE)
+
+    for r in range(ROWS):
+        for c in range(COLS):
+            if board[r][c] != EMPTY:
+                continue
+            walled_by_red  = (r, c) not in reachable_blocking_red
+            walled_by_blue = (r, c) not in reachable_blocking_blue
+            if walled_by_red and not walled_by_blue:
+                scores[RED] += 2
+            elif walled_by_blue and not walled_by_red:
+                scores[BLUE] += 2
+            # else: open, or walled by both → no bonus
 
     return scores
 
@@ -188,9 +200,17 @@ def random_bot(board: list[list[str]], colour: str, move_number: int) -> tuple[i
     return random.choice(moves) if moves else (0, 0)
 
 
-def play_best_of_3(red_bot, blue_bot, red_first: bool = True) -> dict:
+def play_best_of_3(red_bot, blue_bot, red_first: bool = True, alternate_first_move: bool = True) -> dict:
     """
-    Play best-of-3. red_first applies to game 1; alternates each game.
+    Play best-of-3.
+
+    red_first              — whether Red moves first in game 1.
+    alternate_first_move   — when True (default), first-move alternates each
+                             game for standalone fairness. When False, the
+                             same player moves first in every game (used by
+                             the tournament when the lower-spender handicap
+                             must apply to all 3 games).
+
     Returns:
     {
         "round_winner": "R" | "B" | "draw",
@@ -208,7 +228,8 @@ def play_best_of_3(red_bot, blue_bot, red_first: bool = True) -> dict:
         games.append(result)
         if result["winner"] in (RED, BLUE):
             wins[result["winner"]] += 1
-        rf = not rf  # alternate first-move each game
+        if alternate_first_move:
+            rf = not rf
         if wins[RED] == 2 or wins[BLUE] == 2:
             break  # early exit — best of 3 decided
 

@@ -1,21 +1,24 @@
+# Judges under test. Each entry configures the auxiliary.goal_judge slot in
+# the per-heat hermes config — i.e. the LLM that decides done/continue in
+# the /goal loop. The agent's main model is set separately by run.py
+# (default: same across heats, so the only thing varying is the judge).
+#
+# Fields:
+#   model     — model name passed to hermes as the goal_judge model
+#   provider  — provider routing (anthropic, openai, openrouter, …)
+#   face      — optional Faces alias (e.g. "judge@claude-sonnet-4-6").
+#               When set, run.py points goal_judge at the Faces API endpoint
+#               (uses FACES_API_KEY / FACES_BASE_URL from .env).
+
 judges:
   bare:
-    description: "Bare model, no face"
+    description: "Bare base model used as the /goal judge"
     model: claude-sonnet-4-6
     provider: anthropic
     face: null
 
   judge-face:
-    description: "Judge face compiled from source doc via Faces platform"
+    description: "Faces-compiled judge persona over the same base model"
     model: claude-sonnet-4-6
     provider: anthropic
     face: "judge@claude-sonnet-4-6"
-
-problems:
-  - "000"
-  - "001"
-
-budget:
-  token_budget: 20000  # informational — passed to agent in prompt; not enforced by hermes itself
-  wall_budget: 300     # hard ceiling in seconds — run.sh kills agent with `timeout` if exceeded
-                       # override per-run: ./run.sh --token-budget 50000 --wall-budget 600

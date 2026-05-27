@@ -63,32 +63,17 @@ def load_bot(path: str):
         return None
 
 
-def random_bot(board, colour, move_number):
-    """Fallback bot — plays randomly."""
-    moves = [(r, c) for r in range(10) for c in range(10) if board[r][c] == ""]
-    return random.choice(moves) if moves else (0, 0)
-
-
 def read_judge_config(judges_file: str, judge_name: str) -> dict:
-    """Parse judges.yaml for model/provider."""
-    model = "claude-sonnet-4-6"
-    provider = "anthropic"
-    in_judge = False
+    """Parse judges.yaml for one judge entry. Returns its dict (with model/provider/face)."""
+    import yaml
     with open(judges_file) as f:
-        for line in f:
-            if line.strip().startswith(f"{judge_name}:"):
-                in_judge = True
-                continue
-            if in_judge:
-                if line.startswith("  ") and not line.startswith("   "):
-                    # new top-level judge
-                    if not line.strip().startswith("model:") and not line.strip().startswith("provider:") and not line.strip().startswith("face:"):
-                        break
-                if "model:" in line:
-                    model = line.split("model:")[1].strip()
-                if "provider:" in line:
-                    provider = line.split("provider:")[1].strip()
-    return {"model": model, "provider": provider}
+        data = yaml.safe_load(f) or {}
+    entry = (data.get("judges") or {}).get(judge_name, {}) or {}
+    return {
+        "model":    entry.get("model", "claude-sonnet-4-6"),
+        "provider": entry.get("provider", "anthropic"),
+        "face":     entry.get("face"),
+    }
 
 
 def run_hermes(prompt: str, model: str, provider: str, solution_path: str, token_limit: int = 0, log_path: str = "") -> dict:
@@ -211,10 +196,11 @@ def build_prompt(
     my_colour_hint: str,
     went_first_last: bool | None,
 ) -> str:
+    check_tokens_path = os.path.join(REPO_DIR, "check_tokens.sh")
     token_tracking = (
         "**Token tracking:** You can check your current session's token usage at any time by running:\n"
         "```bash\n"
-        "bash /home/hermes/hermes-judge-bench/problems/check_tokens.sh\n"
+        f"bash {check_tokens_path}\n"
         "```\n"
         "This prints `tokens_spent` and `tokens_remaining` for this round. "
         "Check it before deciding whether to keep iterating or say DONE.\n"
@@ -414,8 +400,10 @@ def run_tournament(
         colour_history_b.append(colour_b)
 
         # --- Play best-of-3 ---
+        # alternate_first_move=False: the handicap (lower-spender plays Red and
+        # moves first) applies to ALL 3 games of the round, per problem 300.md.
         print(f"  Playing best-of-3 (A={colour_a}, B={colour_b})...")
-        bo3 = play_best_of_3(red_bot, blue_bot, red_first=True)
+        bo3 = play_best_of_3(red_bot, blue_bot, red_first=True, alternate_first_move=False)
 
         # Translate R/B winner back to A/B
         if bo3["round_winner"] == colour_a:

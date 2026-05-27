@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""
+hermes-judge-bench/run.py — orchestrator + per-heat runner.
+
+Each (problem × judge) pair is one heat. For each heat we:
+  1. Build an isolated HERMES_HOME under results/<heat>/hermes_home/<judge>/
+     with its own .env and config.yaml (the latter sets auxiliary.goal_judge
+     to the row under test).
+  2. Re-exec this file with the "_heat" subcommand inside that HERMES_HOME
+     so hermes_cli reads the isolated config, not the user's global one.
+  3. The child runs a real /goal-style loop using the same AIAgent and
+     same goal_judge auxiliary client the CLI's `/goal` slash command uses.
+     Agent tokens come from AIAgent's session counters; judge tokens come
+     from a thin wrapper around the same auxiliary client judge_goal uses.
+  4. Result JSON is written to results/<heat>/<judge>/<problem>-result.json,
+     compatible with score.py.
+
+Usage:
+    python3 run.py --problems 000 --judges bare
+    python3 run.py --problems 000,001 --judges bare,judge-face
+    python3 run.py                              # all problems × all judges
+    python3 run.py --max-turns 15
+
+The bench tests *the judge*, not the agent. The agent's model/provider are
+the same across rows of judges.yaml; only auxiliary.goal_judge varies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+REPO_DIR = Path(__file__).resolve().parent
+PROBLEMS_DIR = REPO_DIR / "problems"
+RESULTS_DIR = REPO_DIR / "results"
+JUDGES_FILE = REPO_DIR / "judges.yaml"
+ENV_FILE = REPO_DIR / ".env"
+
+# Cache read tokens are billed at ~10% of full price by Anthropic — we count
+# them at that weight so effective_tokens reflects spend, not raw window size.
+CACHE_READ_WEIGHT = 0.1
+
+DEFAULT_MAX_TURNS = 10
+DEFAULT_JUDGE_TIMEOUT = 30.0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# .env helpers — load the repo-local .env into the parent process so
+# the subprocess can inherit ANTHROPIC_API_KEY / FACES_API_KEY.
+# ──────────────────────────────────────────────────────────────────────
+
+def load_env_file(path: Path) -> dict[str, str]:
+    """Parse a .env file. Returns dict of key → value. Missing file → {}."""
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        v = v.strip().strip('"').strip("'")
+        if v:
+            out[k.strip()] = v
+    return out
+
+
+def write_env_file(path: Path, kvs: dict[str, str]) -> None:
+    path.write_text("\n".join(f"{k}={v}" for k, v in kvs.items() if v) + "\n")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# judges.yaml + per-heat HERMES_HOME setup
+# ──────────────────────────────────────────────────────────────────────
+
+def load_judges() -> dict[str, dict]:
+    data = yaml.safe_load(JUDGES_FILE.read_text())
+    return data.get("judges") or {}
+
+
+def build_judge_config(judge_entry: dict, env_kvs: dict[str, str], agent_model: str, agent_provider: str) -> dict:
+    """Return the dict to dump into HERMES_HOME/config.yaml for this heat.
+
+    auxiliary.goal_judge is what we're varying — it's what the /goal loop
+    consults to decide done/continue. The agent's main model stays constant
+    across heats so the only thing changing is the judge.
+    """
+    judge_model    = judge_entry.get("model")    or agent_model
+    judge_provider = judge_entry.get("provider") or agent_provider
+    face           = judge_entry.get("face")
+
+    cfg = {
+        "model": {
+            "default":  agent_model,
+            "provider": agent_provider,
+        },
+        "auxiliary": {
+            "goal_judge": {
+                "model":    judge_model,
+                "provider": judge_provider,
+                "timeout":  DEFAULT_JUDGE_TIMEOUT,
+            },
+        },
+        "goals": {
+            "max_turns": DEFAULT_MAX_TURNS,
+        },
+        "telemetry": {"enabled": False},
+    }
+
+    if face:
+        # Faces routes through an OpenAI-compatible endpoint.
+        base_url = env_kvs.get("FACES_BASE_URL") or "https://api.faces.sh/v1"
+        api_key  = env_kvs.get("FACES_API_KEY") or ""
+        cfg["auxiliary"]["goal_judge"].update({
+            "model":    face,
+            "provider": "custom",
+            "base_url": base_url,
+            "api_key":  api_key or "${FACES_API_KEY}",
+        })
+    return cfg
+
+
+def setup_heat_home(heat_dir: Path, judge_name: str, judge_entry: dict,
+                    env_kvs: dict[str, str], agent_model: str, agent_provider: str) -> Path:
+    """Create an isolated HERMES_HOME for one heat."""
+    home = heat_dir / "hermes_home" / judge_name
+    home.mkdir(parents=True, exist_ok=True)
+
+    # .env — pass through API keys
+    keep = {k: v for k, v in env_kvs.items() if k in {
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+        "FACES_API_KEY", "FACES_BASE_URL",
+    }}
+    write_env_file(home / ".env", keep)
+
+    # config.yaml
+    cfg = build_judge_config(judge_entry, env_kvs, agent_model, agent_provider)
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return home
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-heat child: drives the goal loop. Run with `python3 run.py _heat ...`
+# in a HERMES_HOME-isolated subprocess.
+# ──────────────────────────────────────────────────────────────────────
+
+JUDGE_SYSTEM_PROMPT = (
+    "You are a strict judge evaluating whether an autonomous agent has "
+    "achieved a user's stated goal. You receive the goal text and the "
+    "agent's most recent response. Your only job is to decide whether "
+    "the goal is fully satisfied based on that response.\n\n"
+    "A goal is DONE only when:\n"
+    "- The response explicitly confirms the goal was completed, OR\n"
+    "- The response clearly shows the final deliverable was produced, OR\n"
+    "- The response explains the goal is unachievable / blocked / needs "
+    "user input (treat this as DONE with reason describing the block).\n\n"
+    "Otherwise the goal is NOT done — CONTINUE.\n\n"
+    "Reply ONLY with a single JSON object on one line:\n"
+    '{"done": <true|false>, "reason": "<one-sentence rationale>"}'
+)
+
+JUDGE_USER_TEMPLATE = (
+    "Goal:\n{goal}\n\n"
+    "Agent's most recent response:\n{response}\n\n"
+    "Is the goal satisfied?"
+)
+
+CONTINUATION_PROMPT = (
+    "[Continuing toward your standing goal]\n"
+    "Goal: {goal}\n\n"
+    "Continue working toward this goal. Take the next concrete step. "
+    "If you believe the goal is complete, state so explicitly and stop. "
+    "If you are blocked and need input from the user, say so clearly and stop."
+)
+
+
+def _build_system_prompt(problem_id: str) -> str:
+    return (
+        "You are an autonomous coding agent competing against other agents to solve a "
+        "problem efficiently. Total tokens (yours + the judge's) are penalised linearly — "
+        "each 10,000 tokens halves your score. Stopping early with a correct answer beats "
+        "a slightly better answer that costs twice as many tokens.\n\n"
+        f"Any data files for problem {problem_id} are at {PROBLEMS_DIR}/ (e.g. "
+        f"{PROBLEMS_DIR}/poker.txt, {PROBLEMS_DIR}/corpus/<name>.json). "
+        "Write your Python solution to /tmp/solution.py and run it with `python3 /tmp/solution.py`. "
+        "When you are confident your answer is correct, say DONE and stop."
+    )
+
+
+def _judge_call(goal: str, response_text: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> dict:
+    """Mirror hermes_cli.goals.judge_goal() — same auxiliary client, same prompts,
+    but expose token usage so we can attribute spend to the judge.
+    """
+    from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+
+    client, model = get_text_auxiliary_client("goal_judge")
+    if client is None or not model:
+        return {
+            "verdict": "continue", "reason": "no auxiliary client configured",
+            "parse_failed": False, "input_tokens": 0, "output_tokens": 0,
+        }
+
+    prompt = JUDGE_USER_TEMPLATE.format(goal=goal[:2000], response=response_text[:4000])
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=4096,
+            timeout=timeout,
+            extra_body=get_auxiliary_extra_body() or None,
+        )
+    except Exception as exc:
+        return {
+            "verdict": "continue", "reason": f"judge error: {type(exc).__name__}: {exc}",
+            "parse_failed": False, "input_tokens": 0, "output_tokens": 0,
+        }
+
+    try:
+        raw = resp.choices[0].message.content or ""
+    except Exception:
+        raw = ""
+
+    usage = getattr(resp, "usage", None)
+    in_tok  = getattr(usage, "prompt_tokens", 0) or 0
+    out_tok = getattr(usage, "completion_tokens", 0) or 0
+
+    # Parse — same logic as goals._parse_judge_response, condensed.
+    done, reason, parse_failed = False, "no reason provided", False
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:]
+    data = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*?\}", text, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = None
+    if isinstance(data, dict):
+        done_val = data.get("done")
+        if isinstance(done_val, str):
+            done = done_val.strip().lower() in {"true", "yes", "1", "done"}
+        else:
+            done = bool(done_val)
+        reason = str(data.get("reason") or "").strip() or "no reason provided"
+    else:
+        parse_failed = True
+        reason = f"judge reply was not JSON: {(raw or '')[:200]!r}"
+
+    return {
+        "verdict": "done" if done else "continue", "reason": reason,
+        "parse_failed": parse_failed, "input_tokens": in_tok, "output_tokens": out_tok,
+    }
+
+
+def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_provider: str,
+                   max_turns: int, judge_dir: Path) -> dict:
+    """Run one heat. Returns the full result dict (also written to disk)."""
+    problem_md = PROBLEMS_DIR / f"{problem_id}.md"
+    if not problem_md.exists():
+        raise FileNotFoundError(f"problem file missing: {problem_md}")
+    problem_text = problem_md.read_text()
+
+    goal_text = problem_text.strip()
+    system_prompt = _build_system_prompt(problem_id)
+
+    judge_dir.mkdir(parents=True, exist_ok=True)
+    response_file = judge_dir / f"{problem_id}-response.txt"
+    solution_file = judge_dir / f"{problem_id}-solution.py"
+    result_file   = judge_dir / f"{problem_id}-result.json"
+
+    # Wipe any prior /tmp/solution.py to detect whether the agent wrote one.
+    if os.path.exists("/tmp/solution.py"):
+        os.remove("/tmp/solution.py")
+
+    # Lazy import — keep startup cheap when the orchestrator doesn't need it.
+    from run_agent import AIAgent
+    from hermes_cli.config import load_config
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.tools_config import _get_platform_tools
+
+    cfg = load_config()
+    runtime = resolve_runtime_provider(requested=agent_provider, target_model=agent_model)
+    toolsets = sorted(_get_platform_tools(cfg, "cli"))
+
+    agent = AIAgent(
+        api_key=runtime.get("api_key"),
+        base_url=runtime.get("base_url"),
+        provider=runtime.get("provider"),
+        api_mode=runtime.get("api_mode"),
+        model=agent_model,
+        enabled_toolsets=toolsets,
+        quiet_mode=True,
+        platform="cli",
+        credential_pool=runtime.get("credential_pool"),
+        ephemeral_system_prompt=system_prompt,
+    )
+    agent.suppress_status_output = True
+    agent.stream_delta_callback = None
+    agent.tool_gen_callback = None
+
+    t0 = time.time()
+    transcript: list[dict] = []
+    judge_in_total = 0
+    judge_out_total = 0
+    judge_calls = 0
+    last_response = ""
+    last_verdict = "unknown"
+    last_reason  = ""
+
+    user_msg = goal_text
+    for turn in range(1, max_turns + 1):
+        try:
+            last_response = agent.chat(user_msg) or ""
+        except Exception as exc:
+            last_response = f"[agent error: {type(exc).__name__}: {exc}]"
+            transcript.append({"turn": turn, "role": "agent_error", "text": last_response})
+            break
+
+        transcript.append({"turn": turn, "role": "agent", "text": last_response[:4000]})
+
+        verdict = _judge_call(goal_text, last_response)
+        judge_in_total  += verdict["input_tokens"]
+        judge_out_total += verdict["output_tokens"]
+        judge_calls += 1
+        last_verdict = verdict["verdict"]
+        last_reason  = verdict["reason"]
+        transcript.append({
+            "turn": turn, "role": "judge",
+            "verdict": last_verdict, "reason": last_reason,
+            "input_tokens": verdict["input_tokens"], "output_tokens": verdict["output_tokens"],
+        })
+
+        if last_verdict == "done":
+            break
+        user_msg = CONTINUATION_PROMPT.format(goal=goal_text)
+
+    elapsed = int(time.time() - t0)
+
+    # Pull agent token counts off AIAgent
+    agent_in   = int(getattr(agent, "session_input_tokens", 0) or 0)
+    agent_out  = int(getattr(agent, "session_output_tokens", 0) or 0)
+    agent_crd  = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
+    agent_cwr  = int(getattr(agent, "session_cache_write_tokens", 0) or 0)
+
+    agent_effective = agent_in + agent_out + round(agent_crd * CACHE_READ_WEIGHT)
+    judge_effective = judge_in_total + judge_out_total
+    effective_tokens = agent_effective + judge_effective
+
+    # Persist response + solution if the agent wrote one.
+    response_file.write_text(last_response)
+    if os.path.exists("/tmp/solution.py"):
+        shutil.copy("/tmp/solution.py", solution_file)
+        # leave /tmp/solution.py in place — score.py reads it via the file we copied
+
+    result = {
+        "heat":               judge_dir.parent.name,
+        "problem":            problem_id,
+        "judge":              judge_name,
+        "model":              agent_model,
+        "elapsed_seconds":    elapsed,
+        "max_turns":          max_turns,
+        "turns_used":         (turn if last_response else 0),
+        "killed_by_timeout":  False,
+        "final_verdict":      last_verdict,
+        "final_reason":       last_reason,
+
+        # Agent tokens (the solver)
+        "input_tokens":        agent_in,
+        "output_tokens":       agent_out,
+        "cache_read_tokens":   agent_crd,
+        "cache_write_tokens":  agent_cwr,
+        "cache_read_weight":   CACHE_READ_WEIGHT,
+
+        # Judge tokens (the goal_judge auxiliary)
+        "judge_input_tokens":  judge_in_total,
+        "judge_output_tokens": judge_out_total,
+        "judge_calls":         judge_calls,
+
+        # Combined for pareto scoring
+        "effective_tokens":    effective_tokens,
+
+        "response_file": response_file.name,
+        "solution_file": solution_file.name if solution_file.exists() else None,
+    }
+
+    result_file.write_text(json.dumps(result, indent=2))
+    (judge_dir / f"{problem_id}-transcript.json").write_text(json.dumps(transcript, indent=2))
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Orchestrator entry point
+# ──────────────────────────────────────────────────────────────────────
+
+def orchestrate(args) -> int:
+    judges = load_judges()
+    if not judges:
+        print(f"No judges found in {JUDGES_FILE}", file=sys.stderr)
+        return 2
+
+    if args.judges:
+        sel = [j.strip() for j in args.judges.split(",")]
+        missing = [j for j in sel if j not in judges]
+        if missing:
+            print(f"Unknown judge(s): {missing}. Available: {list(judges)}", file=sys.stderr)
+            return 2
+        judges = {k: judges[k] for k in sel}
+
+    if args.problems:
+        problem_ids = [p.strip() for p in args.problems.split(",")]
+    else:
+        problem_ids = sorted(p.stem for p in PROBLEMS_DIR.glob("*.md"))
+
+    env_kvs = load_env_file(ENV_FILE)
+    if not env_kvs.get("ANTHROPIC_API_KEY") and not env_kvs.get("OPENAI_API_KEY"):
+        print(f"⚠  {ENV_FILE} has no ANTHROPIC_API_KEY (or OPENAI_API_KEY). "
+              "Copy .env.example → .env and fill in your key.", file=sys.stderr)
+
+    heat_id = f"heat_{int(time.time())}"
+    heat_dir = RESULTS_DIR / heat_id
+    heat_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"=== hermes-judge-bench ===")
+    print(f"Heat       : {heat_id}")
+    print(f"Problems   : {problem_ids}")
+    print(f"Judges     : {list(judges)}")
+    print(f"Max turns  : {args.max_turns}")
+    print(f"Agent model: {args.agent_model} (provider={args.agent_provider})")
+    print()
+
+    for problem_id in problem_ids:
+        for judge_name, judge_entry in judges.items():
+            print(f"→ problem={problem_id}  judge={judge_name}")
+            judge_dir = heat_dir / judge_name
+            judge_dir.mkdir(parents=True, exist_ok=True)
+
+            home = setup_heat_home(heat_dir, judge_name, judge_entry, env_kvs,
+                                   args.agent_model, args.agent_provider)
+
+            child_env = os.environ.copy()
+            child_env["HERMES_HOME"] = str(home)
+            child_env["HERMES_YOLO_MODE"] = "1"
+            child_env["HERMES_ACCEPT_HOOKS"] = "1"
+            for k, v in env_kvs.items():
+                child_env.setdefault(k, v)
+
+            cmd = [
+                sys.executable, str(Path(__file__).resolve()), "_heat",
+                "--problem-id",     problem_id,
+                "--judge-name",     judge_name,
+                "--agent-model",    args.agent_model,
+                "--agent-provider", args.agent_provider,
+                "--max-turns",      str(args.max_turns),
+                "--judge-dir",      str(judge_dir),
+            ]
+            proc = subprocess.run(cmd, env=child_env, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"  ⚠ heat failed (exit {proc.returncode}):")
+                if proc.stderr:
+                    print("  " + proc.stderr.replace("\n", "\n  ")[:2000])
+            elif proc.stdout.strip():
+                # child prints a one-line summary on success
+                for line in proc.stdout.strip().splitlines()[-3:]:
+                    print(f"  {line}")
+
+    print(f"\n=== Done. Heat: {heat_id} ===")
+    print(f"  Results: {heat_dir}")
+    print(f"  Score:   python3 score.py --heat {heat_id}")
+    return 0
+
+
+def heat_main(args) -> int:
+    """Subcommand `_heat`: do one (problem × judge) heat in this process.
+
+    HERMES_HOME is already set by the orchestrator before exec'ing us.
+    """
+    result = run_heat_child(
+        problem_id=args.problem_id,
+        judge_name=args.judge_name,
+        agent_model=args.agent_model,
+        agent_provider=args.agent_provider,
+        max_turns=args.max_turns,
+        judge_dir=Path(args.judge_dir),
+    )
+    summary = (
+        f"verdict={result['final_verdict']} turns={result['turns_used']}/{result['max_turns']} "
+        f"agent_tok={result['input_tokens']+result['output_tokens']} "
+        f"judge_tok={result['judge_input_tokens']+result['judge_output_tokens']} "
+        f"elapsed={result['elapsed_seconds']}s"
+    )
+    print(summary)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1] if __doc__ else "")
+    sub = parser.add_subparsers(dest="command")
+
+    # Default = orchestrate
+    parser.add_argument("--problems", default="", help="Comma-separated problem IDs (default: all)")
+    parser.add_argument("--judges",   default="", help="Comma-separated judge names from judges.yaml (default: all)")
+    parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS,
+                        help=f"Max /goal turns per heat (default: {DEFAULT_MAX_TURNS})")
+    parser.add_argument("--agent-model",    default="claude-sonnet-4-6",
+                        help="Agent's main model — held constant across heats so only the judge varies.")
+    parser.add_argument("--agent-provider", default="anthropic")
+
+    heat = sub.add_parser("_heat", help=argparse.SUPPRESS)
+    heat.add_argument("--problem-id",     required=True)
+    heat.add_argument("--judge-name",     required=True)
+    heat.add_argument("--agent-model",    required=True)
+    heat.add_argument("--agent-provider", required=True)
+    heat.add_argument("--max-turns",      type=int, required=True)
+    heat.add_argument("--judge-dir",      required=True)
+
+    args = parser.parse_args()
+    if args.command == "_heat":
+        sys.exit(heat_main(args))
+    sys.exit(orchestrate(args))
+
+
+if __name__ == "__main__":
+    main()

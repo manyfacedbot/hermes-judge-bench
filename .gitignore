@@ -1,4 +1,6 @@
+.env
 results/heat_*/
+results/hermes_home_*/
 __pycache__/
 problems/__pycache__/
 results/*.json
