@@ -53,6 +53,12 @@ CACHE_READ_WEIGHT = 0.1
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
 
+# Toolsets the agent gets each heat. Restricting to these two keeps the agent
+# surface consistent across machines and dodges optional-dep noise from
+# hermes' bundled tools (browser, computer-use, etc.). Override with
+# --toolsets if a problem needs something more.
+DEFAULT_TOOLSETS = "terminal,file"
+
 
 # ──────────────────────────────────────────────────────────────────────
 # .env helpers — load the repo-local .env into the parent process so
@@ -276,7 +282,8 @@ def _judge_call(goal: str, response_text: str, *, timeout: float = DEFAULT_JUDGE
 
 
 def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_provider: str,
-                   max_turns: int, judge_dir: Path, verbose: bool = False) -> dict:
+                   max_turns: int, judge_dir: Path, toolsets: str = DEFAULT_TOOLSETS,
+                   verbose: bool = False) -> dict:
     """Run one heat. Returns the full result dict (also written to disk)."""
     problem_md = PROBLEMS_DIR / f"{problem_id}.md"
     if not problem_md.exists():
@@ -297,13 +304,10 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
 
     # Lazy import — keep startup cheap when the orchestrator doesn't need it.
     from run_agent import AIAgent
-    from hermes_cli.config import load_config
     from hermes_cli.runtime_provider import resolve_runtime_provider
-    from hermes_cli.tools_config import _get_platform_tools
 
-    cfg = load_config()
     runtime = resolve_runtime_provider(requested=agent_provider, target_model=agent_model)
-    toolsets = sorted(_get_platform_tools(cfg, "cli"))
+    toolset_list = [t.strip() for t in (toolsets or "").split(",") if t.strip()]
 
     agent_kwargs = dict(
         api_key=runtime.get("api_key"),
@@ -311,7 +315,7 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         provider=runtime.get("provider"),
         api_mode=runtime.get("api_mode"),
         model=agent_model,
-        enabled_toolsets=toolsets,
+        enabled_toolsets=toolset_list,
         quiet_mode=not verbose,
         platform="cli",
         credential_pool=runtime.get("credential_pool"),
@@ -508,6 +512,7 @@ def orchestrate(args) -> int:
                 "--agent-provider", args.agent_provider,
                 "--max-turns",      str(args.max_turns),
                 "--judge-dir",      str(judge_dir),
+                "--toolsets",       args.toolsets,
             ]
             if args.verbose:
                 cmd.append("--verbose")
@@ -535,6 +540,7 @@ def heat_main(args) -> int:
         agent_provider=args.agent_provider,
         max_turns=args.max_turns,
         judge_dir=Path(args.judge_dir),
+        toolsets=args.toolsets,
         verbose=args.verbose,
     )
     summary = (
@@ -559,6 +565,10 @@ def main():
     parser.add_argument("--agent-model",    default="claude-sonnet-4-6",
                         help="Agent's main model — held constant across heats so only the judge varies.")
     parser.add_argument("--agent-provider", default="anthropic")
+    parser.add_argument("--toolsets", default=DEFAULT_TOOLSETS,
+                        help=f"Comma-separated toolset names enabled for the agent "
+                             f"(default: '{DEFAULT_TOOLSETS}'). Keep this narrow — wider toolsets "
+                             f"pull in optional hermes deps (websockets, browser, etc.) and add noise.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Stream hermes' internal tool-call output to the terminal in addition "
                              "to the per-turn progress lines (firehose).")
@@ -570,6 +580,7 @@ def main():
     heat.add_argument("--agent-provider", required=True)
     heat.add_argument("--max-turns",      type=int, required=True)
     heat.add_argument("--judge-dir",      required=True)
+    heat.add_argument("--toolsets",       default=DEFAULT_TOOLSETS)
     heat.add_argument("--verbose",        action="store_true")
 
     args = parser.parse_args()
