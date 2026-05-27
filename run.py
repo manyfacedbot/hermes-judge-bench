@@ -52,6 +52,11 @@ CACHE_READ_WEIGHT = 0.1
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
+# Hermes' /goal judge is fail-OPEN — a judge error returns "continue" so a
+# transient network blip doesn't wedge a real session. For a benchmark with a
+# misconfigured judge that's a disaster (agent burns 20 full turns on dead
+# verdicts). We bail when the judge errors this many times in a row.
+MAX_CONSECUTIVE_JUDGE_ERRORS = 3
 
 # Toolsets the agent gets each heat. Restricting to these two keeps the agent
 # surface consistent across machines and dodges optional-dep noise from
@@ -133,7 +138,7 @@ def build_judge_config(judge_entry: dict, env_kvs: dict[str, str], agent_model: 
             "model":    face,
             "provider": "custom",
             "base_url": base_url,
-            "api_key":  api_key or "${FACES_API_KEY}",
+            "api_key":  api_key,
         })
     return cfg
 
@@ -309,6 +314,10 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
     runtime = resolve_runtime_provider(requested=agent_provider, target_model=agent_model)
     toolset_list = [t.strip() for t in (toolsets or "").split(",") if t.strip()]
 
+    # Always quiet_mode=True — even with --verbose. Rich's spinner writes one
+    # animation frame per line when stdout isn't a TTY (e.g. tee'd to a file),
+    # which makes the log unreadable. --verbose adds clean tool-call lines via
+    # our own callback instead of relying on hermes' UI.
     agent_kwargs = dict(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -316,13 +325,12 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         api_mode=runtime.get("api_mode"),
         model=agent_model,
         enabled_toolsets=toolset_list,
-        quiet_mode=not verbose,
+        quiet_mode=True,
         platform="cli",
         credential_pool=runtime.get("credential_pool"),
         ephemeral_system_prompt=system_prompt,
     )
     if verbose:
-        # Echo each tool start so the user sees the agent doing things.
         def _tool_start_cb(tool_name, args=None, **_kw):
             try:
                 arg_preview = (json.dumps(args, default=str)[:140] if args else "")
@@ -332,10 +340,9 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         agent_kwargs["tool_start_callback"] = _tool_start_cb
 
     agent = AIAgent(**agent_kwargs)
-    if not verbose:
-        agent.suppress_status_output = True
-        agent.stream_delta_callback = None
-        agent.tool_gen_callback = None
+    agent.suppress_status_output = True
+    agent.stream_delta_callback = None
+    agent.tool_gen_callback = None
 
     t0 = time.time()
     transcript: list[dict] = []
@@ -347,6 +354,7 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
     last_reason  = ""
 
     user_msg = goal_text
+    consecutive_judge_errors = 0
     for turn in range(1, max_turns + 1):
         prev_agent_total = int(getattr(agent, "session_input_tokens", 0) or 0) + \
                            int(getattr(agent, "session_output_tokens", 0) or 0)
@@ -379,10 +387,26 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         judge_calls += 1
         last_verdict = verdict["verdict"]
         last_reason  = verdict["reason"]
+
+        # Distinguish a real "continue" verdict from a judge error/parse-fail
+        # that fell open to "continue". The reason text starts with "judge
+        # error:" or "judge reply was not JSON" / "no auxiliary client" /
+        # "auxiliary client unavailable" in the failure paths.
+        is_judge_failure = verdict["parse_failed"] or any(
+            last_reason.startswith(prefix) for prefix in (
+                "judge error:", "no auxiliary client", "auxiliary client unavailable",
+            )
+        )
+        if is_judge_failure:
+            consecutive_judge_errors += 1
+        else:
+            consecutive_judge_errors = 0
+
         transcript.append({
             "turn": turn, "role": "judge",
             "verdict": last_verdict, "reason": last_reason,
             "input_tokens": verdict["input_tokens"], "output_tokens": verdict["output_tokens"],
+            "is_judge_failure": is_judge_failure,
         })
         print(
             f"    [turn {turn}] judge → {last_verdict} "
@@ -391,6 +415,14 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         )
 
         if last_verdict == "done":
+            break
+        if consecutive_judge_errors >= MAX_CONSECUTIVE_JUDGE_ERRORS:
+            last_verdict = "judge_dead"
+            last_reason = (
+                f"aborted after {consecutive_judge_errors} consecutive judge failures; "
+                f"last reason: {last_reason}"
+            )
+            print(f"    [turn {turn}] ⛔ {last_reason}", flush=True)
             break
         user_msg = CONTINUATION_PROMPT.format(goal=goal_text)
 
@@ -488,8 +520,25 @@ def orchestrate(args) -> int:
     print(f"Agent model: {args.agent_model} (provider={args.agent_provider})", flush=True)
     print(flush=True)
 
+    # Up-front: skip any judge whose required API key is missing, so we don't
+    # burn agent turns on a judge that's going to PermissionDenied every call.
+    usable_judges = {}
+    for name, entry in judges.items():
+        if entry.get("face") and not env_kvs.get("FACES_API_KEY"):
+            print(f"⚠  Skipping judge '{name}': face={entry['face']} but FACES_API_KEY is not "
+                  f"set in {ENV_FILE}. Add it to .env to enable this judge.", flush=True)
+            continue
+        if entry.get("provider") == "anthropic" and not env_kvs.get("ANTHROPIC_API_KEY"):
+            print(f"⚠  Skipping judge '{name}': provider=anthropic but ANTHROPIC_API_KEY is not set.",
+                  flush=True)
+            continue
+        usable_judges[name] = entry
+    if not usable_judges:
+        print("No runnable judges — fix .env and retry.", file=sys.stderr)
+        return 2
+
     for problem_id in problem_ids:
-        for judge_name, judge_entry in judges.items():
+        for judge_name, judge_entry in usable_judges.items():
             print(f"→ problem={problem_id}  judge={judge_name}", flush=True)
             judge_dir = heat_dir / judge_name
             judge_dir.mkdir(parents=True, exist_ok=True)
@@ -501,6 +550,12 @@ def orchestrate(args) -> int:
             child_env["HERMES_HOME"] = str(home)
             child_env["HERMES_YOLO_MODE"] = "1"
             child_env["HERMES_ACCEPT_HOOKS"] = "1"
+            # Kill ANSI / Rich spinner output — we want clean log-friendly text.
+            child_env["NO_COLOR"] = "1"
+            child_env["TERM"] = "dumb"
+            child_env["FORCE_COLOR"] = "0"
+            child_env["RICH_FORCE_TERMINAL"] = "0"
+            child_env["PYTHONUNBUFFERED"] = "1"
             for k, v in env_kvs.items():
                 child_env.setdefault(k, v)
 
@@ -570,8 +625,9 @@ def main():
                              f"(default: '{DEFAULT_TOOLSETS}'). Keep this narrow — wider toolsets "
                              f"pull in optional hermes deps (websockets, browser, etc.) and add noise.")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Stream hermes' internal tool-call output to the terminal in addition "
-                             "to the per-turn progress lines (firehose).")
+                        help="Add a clean one-line echo for every tool call the agent makes, on top "
+                             "of the default per-turn progress lines. Does NOT enable hermes' Rich "
+                             "spinner UI — that breaks log files.")
 
     heat = sub.add_parser("_heat", help=argparse.SUPPRESS)
     heat.add_argument("--problem-id",     required=True)
