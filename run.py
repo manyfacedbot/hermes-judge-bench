@@ -50,7 +50,7 @@ ENV_FILE = REPO_DIR / ".env"
 # them at that weight so effective_tokens reflects spend, not raw window size.
 CACHE_READ_WEIGHT = 0.1
 
-DEFAULT_MAX_TURNS = 10
+DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
 
 
