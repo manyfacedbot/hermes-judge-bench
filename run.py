@@ -28,6 +28,7 @@ the same across rows of judges.yaml; only auxiliary.goal_judge varies.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -39,6 +40,36 @@ import time
 from pathlib import Path
 
 import yaml
+
+
+# Captured at import time — these point at the original terminal even when
+# we redirect_stdout / redirect_stderr to /dev/null during agent.chat().
+_REAL_STDOUT = sys.__stdout__
+
+
+def _term_print(*args, **kwargs):
+    """Print to the original terminal, ignoring any active redirect context."""
+    kwargs.setdefault("file", _REAL_STDOUT)
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _silence_hermes_ui():
+    """Suppress hermes' Rich spinner / status output during agent.chat().
+
+    quiet_mode=True is NOT enough — Rich draws its progress UI through a
+    Console instantiated separately from AIAgent's quiet flag, writing to
+    stderr regardless. When stdout/stderr isn't a TTY (piped to a file) each
+    spinner frame becomes its own line and the log is unreadable. This
+    mirrors what hermes_cli.oneshot.run_oneshot does for the same reason.
+    """
+    devnull = open(os.devnull, "w", encoding="utf-8")
+    try:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            yield
+    finally:
+        devnull.close()
 
 REPO_DIR = Path(__file__).resolve().parent
 PROBLEMS_DIR = REPO_DIR / "problems"
@@ -336,7 +367,8 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
                 arg_preview = (json.dumps(args, default=str)[:140] if args else "")
             except Exception:
                 arg_preview = str(args)[:140]
-            print(f"      [tool] {tool_name}({arg_preview})", flush=True)
+            # Uses _term_print so it bypasses _silence_hermes_ui's redirect.
+            _term_print(f"      [tool] {tool_name}({arg_preview})")
         agent_kwargs["tool_start_callback"] = _tool_start_cb
 
     agent = AIAgent(**agent_kwargs)
@@ -359,13 +391,14 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         prev_agent_total = int(getattr(agent, "session_input_tokens", 0) or 0) + \
                            int(getattr(agent, "session_output_tokens", 0) or 0)
         turn_t0 = time.time()
-        print(f"    [turn {turn}/{max_turns}] agent thinking…", flush=True)
+        _term_print(f"    [turn {turn}/{max_turns}] agent thinking…")
         try:
-            last_response = agent.chat(user_msg) or ""
+            with _silence_hermes_ui():
+                last_response = agent.chat(user_msg) or ""
         except Exception as exc:
             last_response = f"[agent error: {type(exc).__name__}: {exc}]"
             transcript.append({"turn": turn, "role": "agent_error", "text": last_response})
-            print(f"    [turn {turn}] agent ERROR: {last_response[:200]}", flush=True)
+            _term_print(f"    [turn {turn}] agent ERROR: {last_response[:200]}")
             break
 
         agent_now_total = int(getattr(agent, "session_input_tokens", 0) or 0) + \
@@ -373,15 +406,15 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         turn_agent_tok = agent_now_total - prev_agent_total
         turn_elapsed   = int(time.time() - turn_t0)
         reply_preview  = last_response.replace("\n", " ⏎ ")[:120]
-        print(
+        _term_print(
             f"    [turn {turn}] agent done — {turn_agent_tok} tok in {turn_elapsed}s | "
-            f"reply: {reply_preview!r}",
-            flush=True,
+            f"reply: {reply_preview!r}"
         )
 
         transcript.append({"turn": turn, "role": "agent", "text": last_response[:4000]})
 
-        verdict = _judge_call(goal_text, last_response)
+        with _silence_hermes_ui():
+            verdict = _judge_call(goal_text, last_response)
         judge_in_total  += verdict["input_tokens"]
         judge_out_total += verdict["output_tokens"]
         judge_calls += 1
@@ -408,10 +441,9 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
             "input_tokens": verdict["input_tokens"], "output_tokens": verdict["output_tokens"],
             "is_judge_failure": is_judge_failure,
         })
-        print(
+        _term_print(
             f"    [turn {turn}] judge → {last_verdict} "
-            f"({verdict['input_tokens']+verdict['output_tokens']} tok) — {last_reason[:140]}",
-            flush=True,
+            f"({verdict['input_tokens']+verdict['output_tokens']} tok) — {last_reason[:140]}"
         )
 
         if last_verdict == "done":
@@ -422,7 +454,7 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
                 f"aborted after {consecutive_judge_errors} consecutive judge failures; "
                 f"last reason: {last_reason}"
             )
-            print(f"    [turn {turn}] ⛔ {last_reason}", flush=True)
+            _term_print(f"    [turn {turn}] ⛔ {last_reason}")
             break
         user_msg = CONTINUATION_PROMPT.format(goal=goal_text)
 
