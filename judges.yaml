@@ -12,13 +12,17 @@
 
 judges:
   bare:
-    description: "Bare base model used as the /goal judge"
-    model: claude-sonnet-4-6
-    provider: anthropic
+    description: "Bare gpt-4o through Faces (no persona)"
+    model: gpt-4o
+    provider: custom
+    base_url: https://api.faces.sh/v1
+    api_key_env: FACES_API_KEY
     face: null
 
   judge-face:
-    description: "Faces-compiled judge persona over the same base model"
-    model: claude-sonnet-4-6
-    provider: anthropic
-    face: "judge@claude-sonnet-4-6"
+    description: "Faces-compiled judge persona on top of gpt-4o"
+    model: gpt-4o
+    provider: custom
+    base_url: https://api.faces.sh/v1
+    api_key_env: FACES_API_KEY
+    face: "judge@gpt-4o"

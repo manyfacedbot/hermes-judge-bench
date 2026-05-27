@@ -138,9 +138,21 @@ def build_judge_config(judge_entry: dict, env_kvs: dict[str, str], agent_model: 
     auxiliary.goal_judge is what we're varying — it's what the /goal loop
     consults to decide done/continue. The agent's main model stays constant
     across heats so the only thing changing is the judge.
+
+    Each judges.yaml entry may carry:
+      model        — model slug. For a face judge this is the BASE model
+                     (used for clarity/grouping); the actual call uses `face`.
+      provider     — hermes provider name (anthropic, openai, custom, …)
+      base_url     — optional explicit endpoint (e.g. Faces). When set, that
+                     URL receives the judge calls regardless of provider.
+      api_key_env  — optional name of the env var to read the API key from.
+      face         — optional Faces alias; when set, the judge call uses the
+                     face's compiled model name instead of `model`.
     """
     judge_model    = judge_entry.get("model")    or agent_model
     judge_provider = judge_entry.get("provider") or agent_provider
+    base_url       = judge_entry.get("base_url")
+    api_key_env    = judge_entry.get("api_key_env")
     face           = judge_entry.get("face")
 
     cfg = {
@@ -161,16 +173,15 @@ def build_judge_config(judge_entry: dict, env_kvs: dict[str, str], agent_model: 
         "telemetry": {"enabled": False},
     }
 
+    # When the entry specifies a face, the call model is the face alias.
     if face:
-        # Faces routes through an OpenAI-compatible endpoint.
-        base_url = env_kvs.get("FACES_BASE_URL") or "https://api.faces.sh/v1"
-        api_key  = env_kvs.get("FACES_API_KEY") or ""
-        cfg["auxiliary"]["goal_judge"].update({
-            "model":    face,
-            "provider": "custom",
-            "base_url": base_url,
-            "api_key":  api_key,
-        })
+        cfg["auxiliary"]["goal_judge"]["model"] = face
+
+    if base_url:
+        cfg["auxiliary"]["goal_judge"]["base_url"] = base_url
+    if api_key_env:
+        api_key = env_kvs.get(api_key_env, "")
+        cfg["auxiliary"]["goal_judge"]["api_key"] = api_key
     return cfg
 
 
@@ -556,8 +567,9 @@ def orchestrate(args) -> int:
     # burn agent turns on a judge that's going to PermissionDenied every call.
     usable_judges = {}
     for name, entry in judges.items():
-        if entry.get("face") and not env_kvs.get("FACES_API_KEY"):
-            print(f"⚠  Skipping judge '{name}': face={entry['face']} but FACES_API_KEY is not "
+        api_key_env = entry.get("api_key_env")
+        if api_key_env and not env_kvs.get(api_key_env):
+            print(f"⚠  Skipping judge '{name}': api_key_env={api_key_env} but that var is not "
                   f"set in {ENV_FILE}. Add it to .env to enable this judge.", flush=True)
             continue
         if entry.get("provider") == "anthropic" and not env_kvs.get("ANTHROPIC_API_KEY"):
