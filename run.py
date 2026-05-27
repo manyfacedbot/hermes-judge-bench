@@ -276,7 +276,7 @@ def _judge_call(goal: str, response_text: str, *, timeout: float = DEFAULT_JUDGE
 
 
 def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_provider: str,
-                   max_turns: int, judge_dir: Path) -> dict:
+                   max_turns: int, judge_dir: Path, verbose: bool = False) -> dict:
     """Run one heat. Returns the full result dict (also written to disk)."""
     problem_md = PROBLEMS_DIR / f"{problem_id}.md"
     if not problem_md.exists():
@@ -305,21 +305,33 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
     runtime = resolve_runtime_provider(requested=agent_provider, target_model=agent_model)
     toolsets = sorted(_get_platform_tools(cfg, "cli"))
 
-    agent = AIAgent(
+    agent_kwargs = dict(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
         provider=runtime.get("provider"),
         api_mode=runtime.get("api_mode"),
         model=agent_model,
         enabled_toolsets=toolsets,
-        quiet_mode=True,
+        quiet_mode=not verbose,
         platform="cli",
         credential_pool=runtime.get("credential_pool"),
         ephemeral_system_prompt=system_prompt,
     )
-    agent.suppress_status_output = True
-    agent.stream_delta_callback = None
-    agent.tool_gen_callback = None
+    if verbose:
+        # Echo each tool start so the user sees the agent doing things.
+        def _tool_start_cb(tool_name, args=None, **_kw):
+            try:
+                arg_preview = (json.dumps(args, default=str)[:140] if args else "")
+            except Exception:
+                arg_preview = str(args)[:140]
+            print(f"      [tool] {tool_name}({arg_preview})", flush=True)
+        agent_kwargs["tool_start_callback"] = _tool_start_cb
+
+    agent = AIAgent(**agent_kwargs)
+    if not verbose:
+        agent.suppress_status_output = True
+        agent.stream_delta_callback = None
+        agent.tool_gen_callback = None
 
     t0 = time.time()
     transcript: list[dict] = []
@@ -332,12 +344,28 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
 
     user_msg = goal_text
     for turn in range(1, max_turns + 1):
+        prev_agent_total = int(getattr(agent, "session_input_tokens", 0) or 0) + \
+                           int(getattr(agent, "session_output_tokens", 0) or 0)
+        turn_t0 = time.time()
+        print(f"    [turn {turn}/{max_turns}] agent thinking…", flush=True)
         try:
             last_response = agent.chat(user_msg) or ""
         except Exception as exc:
             last_response = f"[agent error: {type(exc).__name__}: {exc}]"
             transcript.append({"turn": turn, "role": "agent_error", "text": last_response})
+            print(f"    [turn {turn}] agent ERROR: {last_response[:200]}", flush=True)
             break
+
+        agent_now_total = int(getattr(agent, "session_input_tokens", 0) or 0) + \
+                          int(getattr(agent, "session_output_tokens", 0) or 0)
+        turn_agent_tok = agent_now_total - prev_agent_total
+        turn_elapsed   = int(time.time() - turn_t0)
+        reply_preview  = last_response.replace("\n", " ⏎ ")[:120]
+        print(
+            f"    [turn {turn}] agent done — {turn_agent_tok} tok in {turn_elapsed}s | "
+            f"reply: {reply_preview!r}",
+            flush=True,
+        )
 
         transcript.append({"turn": turn, "role": "agent", "text": last_response[:4000]})
 
@@ -352,6 +380,11 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
             "verdict": last_verdict, "reason": last_reason,
             "input_tokens": verdict["input_tokens"], "output_tokens": verdict["output_tokens"],
         })
+        print(
+            f"    [turn {turn}] judge → {last_verdict} "
+            f"({verdict['input_tokens']+verdict['output_tokens']} tok) — {last_reason[:140]}",
+            flush=True,
+        )
 
         if last_verdict == "done":
             break
@@ -443,17 +476,17 @@ def orchestrate(args) -> int:
     heat_dir = RESULTS_DIR / heat_id
     heat_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== hermes-judge-bench ===")
-    print(f"Heat       : {heat_id}")
-    print(f"Problems   : {problem_ids}")
-    print(f"Judges     : {list(judges)}")
-    print(f"Max turns  : {args.max_turns}")
-    print(f"Agent model: {args.agent_model} (provider={args.agent_provider})")
-    print()
+    print(f"=== hermes-judge-bench ===", flush=True)
+    print(f"Heat       : {heat_id}", flush=True)
+    print(f"Problems   : {problem_ids}", flush=True)
+    print(f"Judges     : {list(judges)}", flush=True)
+    print(f"Max turns  : {args.max_turns}", flush=True)
+    print(f"Agent model: {args.agent_model} (provider={args.agent_provider})", flush=True)
+    print(flush=True)
 
     for problem_id in problem_ids:
         for judge_name, judge_entry in judges.items():
-            print(f"→ problem={problem_id}  judge={judge_name}")
+            print(f"→ problem={problem_id}  judge={judge_name}", flush=True)
             judge_dir = heat_dir / judge_name
             judge_dir.mkdir(parents=True, exist_ok=True)
 
@@ -476,15 +509,13 @@ def orchestrate(args) -> int:
                 "--max-turns",      str(args.max_turns),
                 "--judge-dir",      str(judge_dir),
             ]
-            proc = subprocess.run(cmd, env=child_env, capture_output=True, text=True)
+            if args.verbose:
+                cmd.append("--verbose")
+            # Don't capture — let the child's per-turn progress lines stream
+            # straight through to the user's terminal in real time.
+            proc = subprocess.run(cmd, env=child_env)
             if proc.returncode != 0:
-                print(f"  ⚠ heat failed (exit {proc.returncode}):")
-                if proc.stderr:
-                    print("  " + proc.stderr.replace("\n", "\n  ")[:2000])
-            elif proc.stdout.strip():
-                # child prints a one-line summary on success
-                for line in proc.stdout.strip().splitlines()[-3:]:
-                    print(f"  {line}")
+                print(f"  ⚠ heat exited non-zero ({proc.returncode}) — see traceback above")
 
     print(f"\n=== Done. Heat: {heat_id} ===")
     print(f"  Results: {heat_dir}")
@@ -504,14 +535,15 @@ def heat_main(args) -> int:
         agent_provider=args.agent_provider,
         max_turns=args.max_turns,
         judge_dir=Path(args.judge_dir),
+        verbose=args.verbose,
     )
     summary = (
-        f"verdict={result['final_verdict']} turns={result['turns_used']}/{result['max_turns']} "
+        f"  ✓ {result['final_verdict']} in {result['turns_used']}/{result['max_turns']} turns | "
         f"agent_tok={result['input_tokens']+result['output_tokens']} "
         f"judge_tok={result['judge_input_tokens']+result['judge_output_tokens']} "
-        f"elapsed={result['elapsed_seconds']}s"
+        f"effective={result['effective_tokens']} elapsed={result['elapsed_seconds']}s"
     )
-    print(summary)
+    print(summary, flush=True)
     return 0
 
 
@@ -527,6 +559,9 @@ def main():
     parser.add_argument("--agent-model",    default="claude-sonnet-4-6",
                         help="Agent's main model — held constant across heats so only the judge varies.")
     parser.add_argument("--agent-provider", default="anthropic")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Stream hermes' internal tool-call output to the terminal in addition "
+                             "to the per-turn progress lines (firehose).")
 
     heat = sub.add_parser("_heat", help=argparse.SUPPRESS)
     heat.add_argument("--problem-id",     required=True)
@@ -535,6 +570,7 @@ def main():
     heat.add_argument("--agent-provider", required=True)
     heat.add_argument("--max-turns",      type=int, required=True)
     heat.add_argument("--judge-dir",      required=True)
+    heat.add_argument("--verbose",        action="store_true")
 
     args = parser.parse_args()
     if args.command == "_heat":
