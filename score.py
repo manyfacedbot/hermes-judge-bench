@@ -39,6 +39,14 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 POETRY_PROBLEMS = {"100", "101", "102", "103"}
 ZKP_PROBLEMS = {"200", "201", "202"}
+ARCH_PROBLEMS = {"300"}
+
+# Archipelago head-to-head config. Bots may be deterministic, so the only
+# variation between games of a fixed pair is who moves first. We play
+# ARCH_GAMES_PER_SIDE games with each judge's bot moving first, seeding the
+# RNG per game so stochastic bots vary but the result stays reproducible.
+ARCH_GAMES_PER_SIDE = 3
+ARCH_BASE_SEED = 42
 
 POETRY_CORPUS = {
     "100": "corpus/romantic_nature.json",
@@ -101,6 +109,91 @@ def run_poetry_eval(solution_py: str, problem: str) -> dict:
         return {"verified": False, "compression_ratio": 0.0, "error": str(e)}
 
 
+def _load_arch_bot(solution_path: str):
+    """Load an Archipelago bot's choose_move from a solution file. None on failure."""
+    if not solution_path or not os.path.exists(solution_path):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("arch_bot", solution_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return getattr(mod, "choose_move", None)
+    except Exception:
+        return None
+
+
+def run_archipelago_headtohead(judge_to_solution: dict) -> dict:
+    """Play each pair of judges' bots head-to-head and return per-judge quality.
+
+    judge_to_solution: {judge_name: solution_path}
+
+    Returns {judge_name: {"quality": float, "got": str, "playable": bool}}.
+
+    quality = (wins + 0.5*draws) / total_games over a symmetric set of games
+    (each judge's bot moves first an equal number of times). With exactly two
+    judges this is a single matchup; with more it's a round-robin and quality
+    is averaged across opponents.
+    """
+    import random as _random
+    sys.path.insert(0, os.path.join(REPO_DIR, "problems"))
+    from archipelago import play_game, RED, BLUE  # noqa: E402
+
+    bots = {j: _load_arch_bot(p) for j, p in judge_to_solution.items()}
+    judges = sorted(judge_to_solution)
+
+    out = {}
+    for j in judges:
+        if bots[j] is None:
+            out[j] = {"quality": 0.0, "got": "no valid bot", "playable": False}
+        else:
+            out[j] = {"quality": None, "got": "", "playable": True,
+                      "_pts": 0.0, "_games": 0, "_record": [0, 0, 0]}  # W,L,D
+
+    playable = [j for j in judges if out[j]["playable"]]
+    if len(playable) < 2:
+        for j in playable:
+            out[j].update(quality=0.0, got="no opponent in heat")
+        return {j: {k: out[j][k] for k in ("quality", "got", "playable")} for j in judges}
+
+    # Round-robin over playable judges.
+    for ai in range(len(playable)):
+        for bi in range(ai + 1, len(playable)):
+            ja, jb = playable[ai], playable[bi]
+            bot_a, bot_b = bots[ja], bots[jb]
+            game_idx = 0
+            # Each bot moves first ARCH_GAMES_PER_SIDE times.
+            for a_is_red in (True, False):
+                red_bot = bot_a if a_is_red else bot_b
+                blue_bot = bot_b if a_is_red else bot_a
+                for _ in range(ARCH_GAMES_PER_SIDE):
+                    _random.seed(ARCH_BASE_SEED + game_idx)
+                    game_idx += 1
+                    res = play_game(red_bot, blue_bot, red_first=True)
+                    w = res["winner"]
+                    if w == "draw":
+                        pa = pb = 0.5
+                        out[ja]["_record"][2] += 1
+                        out[jb]["_record"][2] += 1
+                    else:
+                        a_won = (w == RED and a_is_red) or (w == BLUE and not a_is_red)
+                        pa, pb = (1.0, 0.0) if a_won else (0.0, 1.0)
+                        out[ja]["_record"][0 if a_won else 1] += 1
+                        out[jb]["_record"][1 if a_won else 0] += 1
+                    out[ja]["_pts"] += pa; out[ja]["_games"] += 1
+                    out[jb]["_pts"] += pb; out[jb]["_games"] += 1
+
+    for j in playable:
+        g = out[j]["_games"] or 1
+        out[j]["quality"] = round(out[j]["_pts"] / g, 4)
+        wlr = out[j]["_record"]
+        out[j]["got"] = f"{wlr[0]}W-{wlr[1]}L-{wlr[2]}D"
+
+    return {j: {k: out[j][k] for k in ("quality", "got", "playable")} for j in judges}
+
+
 def score_results(results_dir: str, heat_filter: str | None):
     answers = load_answers()
     rows = []
@@ -114,6 +207,24 @@ def score_results(results_dir: str, heat_filter: str | None):
     if not result_files:
         print("No results found. Run ./run.sh first.")
         return
+
+    # --- Pre-compute Archipelago (300) head-to-head per heat ---------------
+    # 300 is competitive: a judge's quality depends on the OTHER judge's bot,
+    # so it can't be scored one file at a time like the rest. Group the 300
+    # result files by heat, play each heat's judges head-to-head, and stash
+    # the per-judge quality for the main loop to pick up.
+    arch_by_heat: dict[str, dict[str, str]] = {}
+    for rf in result_files:
+        with open(rf) as f:
+            d = json.load(f)
+        if d.get("problem") in ARCH_PROBLEMS:
+            h = d.get("heat", "legacy")
+            sol = os.path.join(os.path.dirname(rf), f"{d.get('problem')}-solution.py")
+            arch_by_heat.setdefault(h, {})[d.get("judge", "?")] = sol
+    arch_scores: dict[tuple[str, str], dict] = {}
+    for h, j2s in arch_by_heat.items():
+        for j, res in run_archipelago_headtohead(j2s).items():
+            arch_scores[(h, j)] = res
 
     for result_file in result_files:
         with open(result_file) as f:
@@ -188,6 +299,19 @@ def score_results(results_dir: str, heat_filter: str | None):
             got = f"cr={compression_ratio:.3f} {'✓' if verified else '✗'}"
             score_type = "poetry"
 
+        elif problem in ARCH_PROBLEMS:
+            arch = arch_scores.get((heat, judge), {"quality": 0.0, "got": "not scored", "playable": False})
+            correctness = arch.get("quality") or 0.0
+            if eff_tok > 0:
+                pareto = correctness / (1 + eff_tok / 10000)
+                token_note = f"{raw_tok}+{cache_r}cr"
+            else:
+                pareto = correctness / (1 + elapsed / 60)
+                token_note = f"{elapsed}s~"
+            expected = "win H2H"
+            got = arch.get("got", "—")
+            score_type = "archipelago"
+
         elif problem == "000":
             output = extract_answer(solution, problem)
             correctness = 1.0 if output else 0.0
@@ -243,6 +367,7 @@ def score_results(results_dir: str, heat_filter: str | None):
     heats = sorted(set(r["heat"] for r in rows))
     std_rows    = [r for r in rows if r["score_type"] == "standard"]
     poetry_rows = [r for r in rows if r["score_type"] == "poetry"]
+    arch_rows   = [r for r in rows if r["score_type"] == "archipelago"]
 
     title = f"Heat: {heat_filter}" if heat_filter else f"All heats ({len(heats)})"
     print(f"\n## hermes-judge-bench Leaderboard — {title}\n")
@@ -268,6 +393,18 @@ def score_results(results_dir: str, heat_filter: str | None):
             print(f"{r['heat']:<22} {r['problem']:<10} {r['judge']:<20} {r['model']:<25} "
                   f"{str(r['token_note']):>14} {str(r['correctness']):>10} {r['pareto_score']:>8} "
                   f"{str(r['got']):>20} {t:>8}")
+
+    if arch_rows:
+        print("\n### Archipelago Head-to-Head  (win_rate / (1 + effective_tokens/10000))\n")
+        print("  win_rate = (wins + 0.5·draws) / games, bots played head-to-head per heat.")
+        print(f"  {ARCH_GAMES_PER_SIDE} games per first-mover side. Got column: W-L-D record.\n")
+        print(f"{'Heat':<22} {'Problem':<10} {'Judge':<20} {'Model':<25} {'Tokens':>14} {'WinRate':>8} {'Pareto':>8} {'Got':>14} {'':>8}")
+        print("-" * 140)
+        for r in sorted(arch_rows, key=lambda x: -x["pareto_score"]):
+            t = "⏱" if r.get("killed") else ""
+            print(f"{r['heat']:<22} {r['problem']:<10} {r['judge']:<20} {r['model']:<25} "
+                  f"{str(r['token_note']):>14} {str(r['correctness']):>8} {r['pareto_score']:>8} "
+                  f"{str(r['got']):>14} {t:>8}")
     print()
 
 
