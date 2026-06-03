@@ -3,8 +3,12 @@
 poetry_eval.py — Evaluation harness for poetry compression problems (100–103).
 
 Usage:
-    python3 poetry_eval.py --corpus corpus/romantic_nature.json --solution /tmp/solution.py
-    python3 poetry_eval.py --corpus corpus/sonnet.json --solution /tmp/solution.py --n 8 --seed 7
+    python3 poetry_eval.py --corpus ~/.hjb-private/corpus/romantic_nature.json --solution /tmp/solution.py
+    python3 poetry_eval.py --corpus ~/.hjb-private/corpus/sonnet.json --solution /tmp/solution.py --n 8 --seed 7
+
+    The poem corpora are SECRET and held out of the repo by design (so agents
+    can't read the test set). See README → "Poetry compression" for where to
+    place them.
 
 Output (JSON to stdout):
     {

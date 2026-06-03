@@ -32,6 +32,7 @@ import math
 import os
 import sys
 import glob
+import random
 import argparse
 import subprocess
 
@@ -48,11 +49,20 @@ ARCH_PROBLEMS = {"300"}
 ARCH_GAMES_PER_SIDE = 3
 ARCH_BASE_SEED = 42
 
+# The poetry corpora are SECRET — agents must generalize from the category
+# description alone and are scored on poems they never see. The corpus files
+# therefore live OUTSIDE the repo working tree (so an agent running in the repo
+# can't read them) and are NOT shipped with the benchmark. Each operator places
+# them at $HJB_CORPUS_DIR (default ~/.hjb-private/corpus/). run.py deliberately
+# strips HJB_CORPUS_DIR from the agent subprocess env so the path never leaks.
+PRIVATE_CORPUS_DIR = os.environ.get(
+    "HJB_CORPUS_DIR", os.path.expanduser("~/.hjb-private/corpus")
+)
 POETRY_CORPUS = {
-    "100": "corpus/romantic_nature.json",
-    "101": "corpus/victorian_lyric.json",
-    "102": "corpus/ode_and_elegy.json",
-    "103": "corpus/sonnet.json",
+    "100": "romantic_nature.json",
+    "101": "victorian_lyric.json",
+    "102": "ode_and_elegy.json",
+    "103": "sonnet.json",
 }
 
 POETRY_EVAL = os.path.join(REPO_DIR, "problems", "poetry_eval.py")
@@ -80,7 +90,7 @@ def extract_answer(solution_py: str, problem: str) -> str | None:
         return None
 
 
-def run_poetry_eval(solution_py: str, problem: str) -> dict:
+def run_poetry_eval(solution_py: str, problem: str, seed: int | None = None) -> dict:
     if not solution_py.strip():
         return {"verified": False, "compression_ratio": 0.0, "error": "no solution"}
 
@@ -88,8 +98,17 @@ def run_poetry_eval(solution_py: str, problem: str) -> dict:
     with open(tmp, "w") as f:
         f.write(solution_py)
 
-    corpus_rel = POETRY_CORPUS[problem]
-    corpus_path = os.path.join(REPO_DIR, "problems", corpus_rel)
+    corpus_path = os.path.join(PRIVATE_CORPUS_DIR, POETRY_CORPUS[problem])
+    if not os.path.exists(corpus_path):
+        return {"verified": False, "compression_ratio": 0.0,
+                "error": (f"secret corpus not found at {corpus_path}. The poems are "
+                          f"held out of the repo by design — place them in "
+                          f"$HJB_CORPUS_DIR (default ~/.hjb-private/corpus/). See README.")}
+
+    # Default: a fresh random sample each scoring run, so the held-out test
+    # poems aren't predictable. Pass an explicit seed only to reproduce a score.
+    if seed is None:
+        seed = random.randint(1, 2**31 - 1)
 
     try:
         result = subprocess.run(
@@ -97,7 +116,7 @@ def run_poetry_eval(solution_py: str, problem: str) -> dict:
              "--corpus", corpus_path,
              "--solution", tmp,
              "--n", "5",
-             "--seed", "42"],
+             "--seed", str(seed)],
             capture_output=True, text=True, timeout=120
         )
         if result.stdout.strip():
@@ -194,7 +213,7 @@ def run_archipelago_headtohead(judge_to_solution: dict) -> dict:
     return {j: {k: out[j][k] for k in ("quality", "got", "playable")} for j in judges}
 
 
-def score_results(results_dir: str, heat_filter: str | None):
+def score_results(results_dir: str, heat_filter: str | None, poetry_seed: int | None = None):
     answers = load_answers()
     rows = []
 
@@ -285,7 +304,7 @@ def score_results(results_dir: str, heat_filter: str | None):
             score_type = "zkp"
 
         elif problem in POETRY_PROBLEMS:
-            eval_result = run_poetry_eval(solution, problem)
+            eval_result = run_poetry_eval(solution, problem, seed=poetry_seed)
             verified = eval_result.get("verified", False)
             compression_ratio = eval_result.get("compression_ratio", 0.0)
             correctness = compression_ratio if verified else 0.0
@@ -412,5 +431,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", default=os.path.join(REPO_DIR, "results"))
     parser.add_argument("--heat", default=None, help="Score only this heat (e.g. heat_1716900000)")
+    parser.add_argument("--poetry-seed", type=int, default=None,
+                        help="Fix the held-out poem sample for reproducible poetry scores "
+                             "(default: a fresh random sample each run).")
     args = parser.parse_args()
-    score_results(args.results, args.heat)
+    score_results(args.results, args.heat, poetry_seed=args.poetry_seed)

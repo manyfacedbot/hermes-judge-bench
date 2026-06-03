@@ -105,22 +105,31 @@ Scoring: `correctness / (1 + effective_tokens / 10000)`.
 
 ### Poetry compression (100–103) — open-ended agentic benchmark
 
-Agents design a losslessly invertible encoding for a category of 19th-century English poetry, competing to maximise compression ratio while minimising token spend.
+Agents design a losslessly invertible encoding for a *category* of 19th-century English poetry, competing to maximise compression ratio while minimising token spend.
 
-| Problem | Category | Corpus |
-|---|---|---|
-| 100 | Romantic nature | `corpus/romantic_nature.json` (9 poems) |
-| 101 | Victorian lyric  | `corpus/victorian_lyric.json` (8 poems) |
-| 102 | Ode & elegy      | `corpus/ode_and_elegy.json` (8 poems) |
-| 103 | Sonnet           | `corpus/sonnet.json` (8 poems) |
+| Problem | Category |
+|---|---|
+| 100 | Romantic nature (Wordsworth, Keats, Shelley, Coleridge) |
+| 101 | Victorian lyric (Tennyson, Browning, Arnold, Rossetti) |
+| 102 | Ode & elegy (Keats's odes, Shelley, Arnold, *In Memoriam*) |
+| 103 | Sonnet (Keats, E.B. Browning, C. Rossetti) |
 
-Scoring: `compression_ratio / (1 + effective_tokens / 10000)`. Round-trip failures score 0.
+**The test poems are secret — by design.** The whole point of these problems is that the agent (and the judge moderating it) gets *only the category description* and must infer what poems of that kind look like — which poets, which diction, which archaic spellings, what line structure — and build an encoder that generalises to poems it never sees. Handing over the poems would collapse that fuzziness into a memorisation exercise (an agent that can read the corpus just embeds it and "compresses" by table lookup).
 
-Direct invocation of the eval harness (paths resolved against your CWD):
+So the corpora are **not shipped in this repo**. They live outside the working tree at `$HJB_CORPUS_DIR` (default `~/.hjb-private/corpus/`), referenced only by `score.py`. `run.py` strips `HJB_*` from the agent subprocess env, the problem statements name no file, and the agent's system prompt explicitly tells it the poems aren't on the machine during its run.
+
+**To score poetry problems**, place the four corpus JSON files (each a list of `{id,title,author,text}` objects) at `~/.hjb-private/corpus/`:
+`romantic_nature.json`, `victorian_lyric.json`, `ode_and_elegy.json`, `sonnet.json` — or point `HJB_CORPUS_DIR` elsewhere.
+
+Scoring: `compression_ratio / (1 + effective_tokens / 10000)`, computed by `score.py` on a **random held-out sample** of the secret poems (fresh sample each run; pass `--poetry-seed N` to reproduce a score). Round-trip failure on any sampled poem scores 0.
+
+> **Secrecy caveat:** the agent runs as a normal subprocess with full filesystem access, so moving the corpus out of the repo defends against honest agents and accidental leakage but not against an agent that actively crawls the filesystem. For an adversarial / public deployment, sandbox the agent (run each heat in a container or jailed cwd where the corpus isn't on any reachable path). Also note: the poems that were committed earlier remain in this repo's **git history** — if this repo is ever made public, treat those specific poems as already exposed and rotate to fresh ones.
+
+Direct invocation of the eval harness against your private corpus:
 
 ```bash
 python3 problems/poetry_eval.py \
-  --corpus problems/corpus/romantic_nature.json \
+  --corpus ~/.hjb-private/corpus/romantic_nature.json \
   --solution /tmp/solution.py \
   --n 5 --seed 42
 ```

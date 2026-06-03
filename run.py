@@ -239,16 +239,40 @@ CONTINUATION_PROMPT = (
 )
 
 
+POETRY_PROBLEM_IDS = {"100", "101", "102", "103"}
+
+
 def _build_system_prompt(problem_id: str) -> str:
-    return (
+    base = (
         "You are an autonomous coding agent competing against other agents to solve a "
         "problem efficiently. Total tokens (yours + the judge's) are penalised linearly — "
         "each 10,000 tokens halves your score. Stopping early with a correct answer beats "
         "a slightly better answer that costs twice as many tokens.\n\n"
-        f"Any data files for problem {problem_id} are at {PROBLEMS_DIR}/ (e.g. "
-        f"{PROBLEMS_DIR}/poker.txt, {PROBLEMS_DIR}/corpus/<name>.json). "
+    )
+
+    if problem_id in POETRY_PROBLEM_IDS:
+        # SECRET held-out eval: the agent must NOT be given the poems. It only
+        # gets the category description in the problem statement, and is scored
+        # on poems it never sees. Do not mention or hint at any corpus file.
+        data_note = (
+            "No data files are provided for this problem. You will be scored on a "
+            "private, held-out set of poems from the stated category that you do NOT "
+            "get to see — so your encode/decode must generalise to any poem of that "
+            "kind, not memorise specific texts. Do not attempt to locate or read any "
+            "corpus on disk; the scoring poems are not on this machine during your run. "
+        )
+    elif problem_id == "054":
+        data_note = f"The data file for this problem is at {PROBLEMS_DIR}/poker.txt. "
+    else:
+        data_note = "This problem needs no external data files. "
+
+    return (
+        base + data_note +
         "Write your Python solution to /tmp/solution.py and run it with `python3 /tmp/solution.py`. "
-        "When you are confident your answer is correct, say DONE and stop."
+        "IMPORTANT: You are scored ONLY by running /tmp/solution.py. If you do not save your "
+        "solution to /tmp/solution.py, you will receive a score of ZERO no matter what you say in "
+        "your reply — stating the answer in chat is not enough. "
+        "When you are confident your answer is correct AND saved to /tmp/solution.py, say DONE and stop."
     )
 
 
@@ -602,6 +626,10 @@ def orchestrate(args) -> int:
             child_env["PYTHONUNBUFFERED"] = "1"
             for k, v in env_kvs.items():
                 child_env.setdefault(k, v)
+            # Never expose the secret-corpus location (or any HJB_* scoring
+            # config) to the agent subprocess — that's score.py's business.
+            for k in [k for k in child_env if k.startswith("HJB_")]:
+                child_env.pop(k, None)
 
             cmd = [
                 sys.executable, str(Path(__file__).resolve()), "_heat",

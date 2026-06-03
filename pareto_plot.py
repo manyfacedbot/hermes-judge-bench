@@ -34,11 +34,15 @@ WWW_DIR  = "/home/hermes/pareto-bench-www"
 POETRY_EVAL = os.path.join(REPO_DIR, "problems", "poetry_eval.py")
 
 POETRY_PROBLEMS = {"100", "101", "102", "103"}
+# Poetry corpora are secret and held out of the repo — see score.py / README.
+PRIVATE_CORPUS_DIR = os.environ.get(
+    "HJB_CORPUS_DIR", os.path.expanduser("~/.hjb-private/corpus")
+)
 POETRY_CORPUS = {
-    "100": "corpus/romantic_nature.json",
-    "101": "corpus/victorian_lyric.json",
-    "102": "corpus/ode_and_elegy.json",
-    "103": "corpus/sonnet.json",
+    "100": "romantic_nature.json",
+    "101": "victorian_lyric.json",
+    "102": "ode_and_elegy.json",
+    "103": "sonnet.json",
 }
 ANSWERS_FILE = os.path.join(REPO_DIR, "answers.json")
 
@@ -96,7 +100,7 @@ def eval_solution(solution: str, problem: str) -> float:
         tmp = f"/tmp/plot_solution_{problem}.py"
         with open(tmp, "w") as f:
             f.write(solution)
-        corpus_path = os.path.join(REPO_DIR, "problems", POETRY_CORPUS[problem])
+        corpus_path = os.path.join(PRIVATE_CORPUS_DIR, POETRY_CORPUS[problem])
         try:
             r = subprocess.run(
                 ["python3", POETRY_EVAL, "--corpus", corpus_path,
