@@ -438,7 +438,19 @@ def run_heat_child(*, problem_id: str, judge_name: str, agent_model: str, agent_
         _term_print(f"    [turn {turn}/{max_turns}] agent thinking…")
         try:
             with _silence_hermes_ui():
-                last_response = agent.chat(user_msg) or ""
+                # Use run_conversation, not chat(): chat() does
+                # result["final_response"] and raises KeyError when hermes ends a
+                # turn on its internal tool-call ceiling (the result dict lacks
+                # that key). run_conversation returns the same dict — we pull the
+                # reply out defensively so a maxed-out turn doesn't crash the heat
+                # and the real token spend below still gets recorded.
+                conv = agent.run_conversation(user_msg)
+            if isinstance(conv, dict):
+                last_response = (conv.get("final_response")
+                                 or conv.get("response")
+                                 or conv.get("final_text") or "") or ""
+            else:
+                last_response = str(conv or "")
         except Exception as exc:
             last_response = f"[agent error: {type(exc).__name__}: {exc}]"
             transcript.append({"turn": turn, "role": "agent_error", "text": last_response})
