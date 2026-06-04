@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -185,10 +186,14 @@ def build_judge_config(judge_entry: dict, env_kvs: dict[str, str], agent_model: 
     return cfg
 
 
-def setup_heat_home(heat_dir: Path, judge_name: str, judge_entry: dict,
+def setup_heat_home(home: Path, judge_entry: dict,
                     env_kvs: dict[str, str], agent_model: str, agent_provider: str) -> Path:
-    """Create an isolated HERMES_HOME for one heat."""
-    home = heat_dir / "hermes_home" / judge_name
+    """Write an isolated HERMES_HOME (config.yaml + .env) at `home`.
+
+    `home` lives OUTSIDE the repo (a per-heat temp dir) so an agent that
+    inspects $HERMES_HOME can't learn the repo path and walk to the secret
+    poetry corpus. config.yaml / .env carry no repo paths themselves.
+    """
     home.mkdir(parents=True, exist_ok=True)
 
     # .env — pass through API keys
@@ -253,15 +258,19 @@ def _build_system_prompt(problem_id: str) -> str:
     if problem_id in POETRY_PROBLEM_IDS:
         # SECRET held-out eval: the agent must NOT be given the poems. It only
         # gets the category description in the problem statement, and is scored
-        # on poems it never sees. Do not mention or hint at any corpus file.
+        # on poems it never sees. The heat runs in an isolated cwd that does not
+        # contain the corpus, so don't mention or hint at any corpus file.
         data_note = (
             "No data files are provided for this problem. You will be scored on a "
-            "private, held-out set of poems from the stated category that you do NOT "
-            "get to see — so your encode/decode must generalise to any poem of that "
-            "kind, not memorise specific texts. Do not attempt to locate or read any "
-            "corpus on disk; the scoring poems are not on this machine during your run. "
+            "held-out set of poems from the stated category that you do NOT get to "
+            "see — so your encode/decode must generalise to any poem of that kind, "
+            "not memorise specific texts. Do not go looking for a poem corpus on "
+            "disk; the scoring poems are not in your working directory. "
         )
     elif problem_id == "054":
+        # poker.txt is public test data (not secret like the poetry corpus), so
+        # an absolute path is fine — and it keeps working when score.py re-runs
+        # the solution from a different cwd.
         data_note = f"The data file for this problem is at {PROBLEMS_DIR}/poker.txt. "
     else:
         data_note = "This problem needs no external data files. "
@@ -611,11 +620,22 @@ def orchestrate(args) -> int:
             judge_dir = heat_dir / judge_name
             judge_dir.mkdir(parents=True, exist_ok=True)
 
-            home = setup_heat_home(heat_dir, judge_name, judge_entry, env_kvs,
-                                   args.agent_model, args.agent_provider)
+            # Per-heat sandbox OUTSIDE the repo. It holds the isolated HERMES_HOME
+            # and the agent's working directory. Keeping both off the repo tree
+            # means an agent that inspects $HERMES_HOME, $PWD, or runs `ls`/`pwd`
+            # never learns the repo path, so it can't walk to the secret poetry
+            # corpus at problems/corpus/. (A determined `find /` could still reach
+            # it — that needs real container isolation; see README.) Result
+            # artifacts still go to judge_dir (an absolute path under the repo).
+            sandbox = tempfile.mkdtemp(prefix=f"hjb_{problem_id}_{judge_name}_")
+            home = setup_heat_home(Path(sandbox) / "hermes_home", judge_entry,
+                                   env_kvs, args.agent_model, args.agent_provider)
+            work = Path(sandbox) / "work"
+            work.mkdir(parents=True, exist_ok=True)
 
             child_env = os.environ.copy()
             child_env["HERMES_HOME"] = str(home)
+            child_env["PWD"] = str(work)   # keep $PWD consistent with the real cwd
             child_env["HERMES_YOLO_MODE"] = "1"
             child_env["HERMES_ACCEPT_HOOKS"] = "1"
             # Kill ANSI / Rich spinner output — we want clean log-friendly text.
@@ -626,8 +646,8 @@ def orchestrate(args) -> int:
             child_env["PYTHONUNBUFFERED"] = "1"
             for k, v in env_kvs.items():
                 child_env.setdefault(k, v)
-            # Never expose the secret-corpus location (or any HJB_* scoring
-            # config) to the agent subprocess — that's score.py's business.
+            # Never expose the corpus location (or any HJB_* scoring config) to
+            # the agent subprocess — that's score.py's business.
             for k in [k for k in child_env if k.startswith("HJB_")]:
                 child_env.pop(k, None)
 
@@ -645,7 +665,10 @@ def orchestrate(args) -> int:
                 cmd.append("--verbose")
             # Don't capture — let the child's per-turn progress lines stream
             # straight through to the user's terminal in real time.
-            proc = subprocess.run(cmd, env=child_env)
+            try:
+                proc = subprocess.run(cmd, env=child_env, cwd=str(work))
+            finally:
+                shutil.rmtree(sandbox, ignore_errors=True)
             if proc.returncode != 0:
                 print(f"  ⚠ heat exited non-zero ({proc.returncode}) — see traceback above")
 

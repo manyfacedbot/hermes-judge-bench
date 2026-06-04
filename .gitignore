@@ -6,7 +6,3 @@ problems/__pycache__/
 results/*.json
 results/*.py
 !results/.gitkeep
-
-# Poetry corpora are secret — never commit them back into the repo
-problems/corpus/
-*.corpus.json

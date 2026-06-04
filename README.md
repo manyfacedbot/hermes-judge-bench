@@ -10,18 +10,19 @@ A judge face compiled from sources that exemplify rigorous, conservative, eviden
 
 Hermes' `/goal` slash command runs a Ralph-style loop: after every agent turn, an auxiliary judge LLM (configured at `auxiliary.goal_judge` in `~/.hermes/config.yaml`) decides done/continue. This benchmark *holds the agent constant* and varies only the judge, then measures pareto = `correctness / (1 + total_tokens / 10000)` across a set of problems.
 
-The runner spawns one subprocess per (problem × judge) heat. Each subprocess gets its own isolated `HERMES_HOME` with a per-judge `config.yaml`, so judges don't share state and the host's hermes config isn't touched.
+The runner spawns one subprocess per (problem × judge) heat. Each heat runs in a throwaway sandbox **outside the repo** (a `/tmp/hjb_*` dir) that holds its isolated `HERMES_HOME` (with a per-judge `config.yaml`) and the agent's working directory — so judges don't share state, the host's hermes config isn't touched, and the agent can't see the repo (which keeps the secret poetry corpus out of reach). Only scoring artifacts land back under the repo:
 
 ```
 results/heat_<unix>/
-  hermes_home/<judge>/        # isolated ~/.hermes/ for this heat (gitignored)
-    config.yaml               #   auxiliary.goal_judge = the judge under test
-    .env                      #   API keys
   <judge>/                    # per-judge outputs for scoring
     <problem>-result.json     #   tokens, verdict, elapsed, agent/judge attribution
     <problem>-response.txt    #   the agent's final reply
     <problem>-solution.py     #   /tmp/solution.py the agent wrote (if any)
     <problem>-transcript.json #   per-turn agent reply + judge verdict
+
+/tmp/hjb_<problem>_<judge>_*/ # throwaway per-heat sandbox (deleted after the heat)
+  hermes_home/                #   isolated HERMES_HOME: config.yaml + .env
+  work/                       #   the agent's cwd — no repo files here
 ```
 
 ## Setup (one time)
@@ -114,22 +115,19 @@ Agents design a losslessly invertible encoding for a *category* of 19th-century 
 | 102 | Ode & elegy (Keats's odes, Shelley, Arnold, *In Memoriam*) |
 | 103 | Sonnet (Keats, E.B. Browning, C. Rossetti) |
 
-**The test poems are secret — by design.** The whole point of these problems is that the agent (and the judge moderating it) gets *only the category description* and must infer what poems of that kind look like — which poets, which diction, which archaic spellings, what line structure — and build an encoder that generalises to poems it never sees. Handing over the poems would collapse that fuzziness into a memorisation exercise (an agent that can read the corpus just embeds it and "compresses" by table lookup).
+**The test poems are kept secret from the agent — by design.** The whole point of these problems is that the agent (and the judge moderating it) gets *only the category description* and must infer what poems of that kind look like — which poets, which diction, which archaic spellings, what line structure — and build an encoder that generalises to poems it never sees. If the agent could read the test poems it would just embed them and "compress" by table lookup (we observed exactly this: ratios of 50×+ that are pure memorisation).
 
-So the corpora are **not shipped in this repo**. They live outside the working tree at `$HJB_CORPUS_DIR` (default `~/.hjb-private/corpus/`), referenced only by `score.py`. `run.py` strips `HJB_*` from the agent subprocess env, the problem statements name no file, and the agent's system prompt explicitly tells it the poems aren't on the machine during its run.
+The poems **do ship with the repo** (under `problems/corpus/` — operators who clone the benchmark need them to score). They're kept out of the *agent's* reach a different way: `run.py` runs each heat in an isolated working directory **outside** the repo, with `HERMES_HOME` and `$PWD` also pointed there, and never tells the agent the repo path. So a poetry agent's `ls` / `pwd` / `$HERMES_HOME` reveal only the sandbox — it can't see `problems/corpus/`. The problem statements name no file and the system prompt states there are no data files.
 
-**To score poetry problems**, place the four corpus JSON files (each a list of `{id,title,author,text}` objects) at `~/.hjb-private/corpus/`:
-`romantic_nature.json`, `victorian_lyric.json`, `ode_and_elegy.json`, `sonnet.json` — or point `HJB_CORPUS_DIR` elsewhere.
+Scoring: `compression_ratio / (1 + effective_tokens / 10000)`, computed by `score.py` on a held-out sample of the poems (fixed `--poetry-seed`, default 42, so scores are reproducible and comparable across operators). Round-trip failure on any sampled poem scores 0.
 
-Scoring: `compression_ratio / (1 + effective_tokens / 10000)`, computed by `score.py` on a **random held-out sample** of the secret poems (fresh sample each run; pass `--poetry-seed N` to reproduce a score). Round-trip failure on any sampled poem scores 0.
+> **Secrecy caveat:** the agent still runs as a normal subprocess with full filesystem access. The isolated cwd defends against an honest agent (and accidental adjacency), but an agent that actively crawls the filesystem (`find / -name '*.json'`) could still reach `problems/corpus/`. For an adversarial / public deployment, run each heat inside a container or chroot where the repo isn't on any reachable path. Point `HJB_CORPUS_DIR` at the corpus location if you relocate it.
 
-> **Secrecy caveat:** the agent runs as a normal subprocess with full filesystem access, so moving the corpus out of the repo defends against honest agents and accidental leakage but not against an agent that actively crawls the filesystem. For an adversarial / public deployment, sandbox the agent (run each heat in a container or jailed cwd where the corpus isn't on any reachable path). Also note: the poems that were committed earlier remain in this repo's **git history** — if this repo is ever made public, treat those specific poems as already exposed and rotate to fresh ones.
-
-Direct invocation of the eval harness against your private corpus:
+Direct invocation of the eval harness:
 
 ```bash
 python3 problems/poetry_eval.py \
-  --corpus ~/.hjb-private/corpus/romantic_nature.json \
+  --corpus problems/corpus/romantic_nature.json \
   --solution /tmp/solution.py \
   --n 5 --seed 42
 ```

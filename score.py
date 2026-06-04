@@ -32,7 +32,6 @@ import math
 import os
 import sys
 import glob
-import random
 import argparse
 import subprocess
 
@@ -49,14 +48,13 @@ ARCH_PROBLEMS = {"300"}
 ARCH_GAMES_PER_SIDE = 3
 ARCH_BASE_SEED = 42
 
-# The poetry corpora are SECRET — agents must generalize from the category
-# description alone and are scored on poems they never see. The corpus files
-# therefore live OUTSIDE the repo working tree (so an agent running in the repo
-# can't read them) and are NOT shipped with the benchmark. Each operator places
-# them at $HJB_CORPUS_DIR (default ~/.hjb-private/corpus/). run.py deliberately
-# strips HJB_CORPUS_DIR from the agent subprocess env so the path never leaks.
-PRIVATE_CORPUS_DIR = os.environ.get(
-    "HJB_CORPUS_DIR", os.path.expanduser("~/.hjb-private/corpus")
+# Poetry corpora ship WITH the repo (operators who clone it need them to score).
+# The poems are kept secret from the AGENT UNDER TEST a different way: run.py runs
+# each heat in an isolated working directory that doesn't contain the corpus, and
+# never tells the agent the poems exist. So score.py just reads them in-repo.
+# Override the location with HJB_CORPUS_DIR if you keep the poems elsewhere.
+CORPUS_DIR = os.environ.get(
+    "HJB_CORPUS_DIR", os.path.join(REPO_DIR, "problems", "corpus")
 )
 POETRY_CORPUS = {
     "100": "romantic_nature.json",
@@ -98,17 +96,17 @@ def run_poetry_eval(solution_py: str, problem: str, seed: int | None = None) -> 
     with open(tmp, "w") as f:
         f.write(solution_py)
 
-    corpus_path = os.path.join(PRIVATE_CORPUS_DIR, POETRY_CORPUS[problem])
+    corpus_path = os.path.join(CORPUS_DIR, POETRY_CORPUS[problem])
     if not os.path.exists(corpus_path):
         return {"verified": False, "compression_ratio": 0.0,
-                "error": (f"secret corpus not found at {corpus_path}. The poems are "
-                          f"held out of the repo by design — place them in "
-                          f"$HJB_CORPUS_DIR (default ~/.hjb-private/corpus/). See README.")}
+                "error": (f"corpus not found at {corpus_path}. It should ship with the "
+                          f"repo under problems/corpus/ — or set HJB_CORPUS_DIR. See README.")}
 
-    # Default: a fresh random sample each scoring run, so the held-out test
-    # poems aren't predictable. Pass an explicit seed only to reproduce a score.
+    # Fixed seed by default so scores are reproducible and comparable across
+    # operators (the agent can't see the poems, so the sample needn't be secret).
+    # Pass --poetry-seed to vary the held-out sample.
     if seed is None:
-        seed = random.randint(1, 2**31 - 1)
+        seed = 42
 
     try:
         result = subprocess.run(
